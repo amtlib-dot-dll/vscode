@@ -12,6 +12,11 @@ const gulptslint = require('gulp-tslint');
 const gulpeslint = require('gulp-eslint');
 const tsfmt = require('typescript-formatter');
 const tslint = require('tslint');
+const VinylFile = require('vinyl');
+const vfs = require('vinyl-fs');
+const path = require('path');
+const fs = require('fs');
+const pall = require('p-all');
 
 /**
  * Hygiene works by creating cascading subsets of all our files and
@@ -54,7 +59,9 @@ const indentationFilter = [
 	'!**/*.md',
 	'!**/*.ps1',
 	'!**/*.template',
+	'!**/*.yaml',
 	'!**/*.yml',
+	'!**/yarn.lock',
 	'!**/lib/**',
 	'!extensions/**/*.d.ts',
 	'!src/typings/**/*.d.ts',
@@ -62,11 +69,11 @@ const indentationFilter = [
 	'!**/*.d.ts.recipe',
 	'!test/assert.js',
 	'!**/package.json',
-	'!**/npm-shrinkwrap.json',
 	'!**/octicons/**',
 	'!**/vs/base/common/marked/raw.marked.js',
 	'!**/vs/base/common/winjs.base.raw.js',
 	'!**/vs/base/node/terminateProcess.sh',
+	'!**/vs/base/node/ps-win.ps1',
 	'!**/vs/nls.js',
 	'!**/vs/css.js',
 	'!**/vs/loader.js',
@@ -74,7 +81,8 @@ const indentationFilter = [
 	'!extensions/**/syntaxes/**',
 	'!extensions/**/themes/**',
 	'!extensions/**/colorize-fixtures/**',
-	'!extensions/vscode-api-tests/testWorkspace/**'
+	'!extensions/vscode-api-tests/testWorkspace/**',
+	'!extensions/vscode-api-tests/testWorkspace2/**'
 ];
 
 const copyrightFilter = [
@@ -92,7 +100,9 @@ const copyrightFilter = [
 	'!**/*.xpm',
 	'!**/*.opts',
 	'!**/*.disabled',
+	'!**/*.code-workspace',
 	'!build/**/*.init',
+	'!resources/linux/snap/snapcraft.yaml',
 	'!resources/win32/bin/code.js',
 	'!extensions/markdown/media/tomorrow.css',
 	'!extensions/html/server/src/modes/typescript/*'
@@ -120,7 +130,9 @@ const tslintFilter = [
 	'!**/node_modules/**',
 	'!extensions/typescript/test/colorize-fixtures/**',
 	'!extensions/vscode-api-tests/testWorkspace/**',
-	'!extensions/**/*.test.ts'
+	'!extensions/vscode-api-tests/testWorkspace2/**',
+	'!extensions/**/*.test.ts',
+	'!extensions/html/server/lib/jquery.d.ts'
 ];
 
 const copyrightHeader = [
@@ -130,19 +142,8 @@ const copyrightHeader = [
 	' *--------------------------------------------------------------------------------------------*/'
 ].join('\n');
 
-function reportFailures(failures) {
-	failures.forEach(failure => {
-		const name = failure.name || failure.fileName;
-		const position = failure.startPosition;
-		const line = position.lineAndCharacter ? position.lineAndCharacter.line : position.line;
-		const character = position.lineAndCharacter ? position.lineAndCharacter.character : position.character;
-
-		console.error(`${name}:${line + 1}:${character + 1}:${failure.failure}`);
-	});
-}
-
 gulp.task('eslint', () => {
-	return gulp.src(all, { base: '.' })
+	return vfs.src(all, { base: '.', follow: true, allowEmpty: true })
 		.pipe(filter(eslintFilter))
 		.pipe(gulpeslint('src/.eslintrc'))
 		.pipe(gulpeslint.formatEach('compact'))
@@ -150,15 +151,15 @@ gulp.task('eslint', () => {
 });
 
 gulp.task('tslint', () => {
-	const options = { summarizeFailureOutput: true };
+	const options = { emitError: true };
 
-	return gulp.src(all, { base: '.' })
+	return vfs.src(all, { base: '.', follow: true, allowEmpty: true })
 		.pipe(filter(tslintFilter))
-		.pipe(gulptslint({ rulesDirectory: 'build/lib/tslint' }))
-		.pipe(gulptslint.report(reportFailures, options));
+		.pipe(gulptslint.default({ rulesDirectory: 'build/lib/tslint' }))
+		.pipe(gulptslint.default.report(options));
 });
 
-const hygiene = exports.hygiene = (some, options) => {
+function hygiene(some, options) {
 	options = options || {};
 	let errorCount = 0;
 
@@ -205,6 +206,11 @@ const hygiene = exports.hygiene = (some, options) => {
 			verify: true,
 			tsfmt: true,
 			// verbose: true
+			// keep checkJS happy
+			editorconfig: undefined,
+			replace: undefined,
+			tsconfig: undefined,
+			tslint: undefined
 		}).then(result => {
 			if (result.error) {
 				console.error(result.message);
@@ -217,23 +223,73 @@ const hygiene = exports.hygiene = (some, options) => {
 		});
 	});
 
-	const tsl = es.through(function (file) {
-		const configuration = tslint.Configuration.findConfiguration(null, '.');
-		const options = { formatter: 'json', rulesDirectory: 'build/lib/tslint' };
-		const contents = file.contents.toString('utf8');
-		const linter = new tslint.Linter(options);
-		linter.lint(file.relative, contents, configuration.results);
-		const result = linter.getResult();
+	let linterForProgram = {}; // maps tslint programs to its corresponding Linter
+	let createProgramForTslint = false; // too expensive, disabled for now
+	const configuration = tslint.Configuration.findConfiguration('tslint-hygiene.json', '.');
 
-		if (result.failureCount > 0) {
-			reportFailures(result.failures);
-			errorCount += result.failureCount;
+	function createLinter(tsconfig) {
+		const tslintOptions = { fix: false, formatter: 'json' };
+		if (createProgramForTslint) {
+			const program = tslint.Linter.createProgram(tsconfig);
+			return new tslint.Linter(tslintOptions, program);
 		}
+		return new tslint.Linter(tslintOptions);
+	}
 
+	function findTsConfig(segments) {
+		let fsPath = segments.reduce((p, each) => path.join(p, each));
+		let tsconfig = path.join(fsPath, 'tsconfig.json');
+		if (fs.existsSync(tsconfig)) {
+			return tsconfig;
+		} else if (segments.length > 1) {
+			segments.splice(-1, 1);
+			return findTsConfig(segments);
+		} else {
+			return undefined;
+		}
+	}
+
+	function getLinter(file) {
+		let segments = file.relative.split(path.sep);
+
+		// hard code the location of the tsconfig.json for the source folder to eliminate the lookup for the tsconfig.json
+		if (segments[0] === 'src') {
+			if (!linterForProgram['src']) {
+				linterForProgram['src'] = createLinter('src/tsconfig.json');
+			}
+			return linterForProgram['src'];
+		}
+		else {
+			segments.splice(-1, 1);
+			let tsconfig = findTsConfig(segments);
+			if (!tsconfig) {
+				return undefined;
+			}
+			if (!linterForProgram[tsconfig]) {
+				linterForProgram[tsconfig] = createLinter(tsconfig);
+			}
+			return linterForProgram[tsconfig];
+		}
+	}
+
+	const tsl = es.through(function (file) {
+		const contents = file.contents.toString('utf8');
+		let linter = getLinter(file);
+		if (linter) {
+			linter.lint(file.relative, contents, configuration.results);
+		}
 		this.emit('data', file);
 	});
 
-	const result = gulp.src(some || all, { base: '.' })
+	let input;
+
+	if (Array.isArray(some) || typeof some === 'string' || !some) {
+		input = vfs.src(some || all, { base: '.', follow: true, allowEmpty: true });
+	} else {
+		input = some;
+	}
+
+	const result = input
 		.pipe(filter(f => !f.stat.isDirectory()))
 		.pipe(filter(eolFilter))
 		.pipe(options.skipEOL ? es.through() : eol)
@@ -253,15 +309,72 @@ const hygiene = exports.hygiene = (some, options) => {
 		.pipe(gulpeslint.formatEach('compact'))
 		.pipe(gulpeslint.failAfterError());
 
+	let count = 0;
 	return es.merge(typescript, javascript)
-		.pipe(es.through(null, function () {
+		.pipe(es.through(function (data) {
+			count++;
+			if (process.env['TRAVIS'] && count % 10 === 0) {
+				process.stdout.write('.');
+			}
+			this.emit('data', data);
+		}, function () {
+			process.stdout.write('\n');
+
+			for (let linter in linterForProgram) {
+				const tslintResult = linterForProgram[linter].getResult();
+				if (tslintResult.failures.length > 0) {
+					for (const failure of tslintResult.failures) {
+						const name = failure.getFileName();
+						const position = failure.getStartPosition();
+						const line = position.getLineAndCharacter().line;
+						const character = position.getLineAndCharacter().character;
+
+						console.error(`${name}:${line + 1}:${character + 1}:${failure.getFailure()}`);
+					}
+					errorCount += tslintResult.failures.length;
+				}
+			}
+
 			if (errorCount > 0) {
 				this.emit('error', 'Hygiene failed with ' + errorCount + ' errors. Check \'build/gulpfile.hygiene.js\'.');
 			} else {
 				this.emit('end');
 			}
 		}));
-};
+}
+
+function createGitIndexVinyls(paths) {
+	const cp = require('child_process');
+	const repositoryPath = process.cwd();
+
+	const fns = paths.map(relativePath => () => new Promise((c, e) => {
+		const fullPath = path.join(repositoryPath, relativePath);
+
+		fs.stat(fullPath, (err, stat) => {
+			if (err && err.code === 'ENOENT') { // ignore deletions
+				return c(null);
+			} else if (err) {
+				return e(err);
+			}
+
+			cp.exec(`git show :${relativePath}`, { maxBuffer: 2000 * 1024, encoding: 'buffer' }, (err, out) => {
+				if (err) {
+					return e(err);
+				}
+
+				c(new VinylFile({
+					path: fullPath,
+					base: repositoryPath,
+					contents: out,
+					stat
+				}));
+			});
+		});
+	}));
+
+	return pall(fns, { concurrency: 4 })
+		.then(r => r.filter(p => !!p));
+}
 
 gulp.task('hygiene', () => hygiene());
 
@@ -290,17 +403,26 @@ if (require.main === module) {
 				console.error();
 				console.error(err);
 				process.exit(1);
+				return;
 			}
 
 			const some = out
 				.split(/\r?\n/)
 				.filter(l => !!l);
 
-			hygiene(some, { skipEOL: skipEOL }).on('error', err => {
-				console.error();
-				console.error(err);
-				process.exit(1);
-			});
+			if (some.length > 0) {
+				console.log('Reading git index versions...');
+
+				createGitIndexVinyls(some)
+					.then(vinyls => new Promise((c, e) => hygiene(es.readArray(vinyls), { skipEOL: skipEOL })
+						.on('end', () => c())
+						.on('error', e)))
+					.catch(err => {
+						console.error();
+						console.error(err);
+						process.exit(1);
+					});
+			}
 		});
 	});
 }

@@ -5,13 +5,14 @@
 
 import * as nls from 'vs/nls';
 import * as platform from 'vs/base/common/platform';
+import cp = require('child_process');
 import { IDisposable } from 'vs/base/common/lifecycle';
 import { TPromise } from 'vs/base/common/winjs.base';
 import { ITerminalService, ITerminalInstance, ITerminalConfiguration } from 'vs/workbench/parts/terminal/common/terminal';
 import { ITerminalService as IExternalTerminalService } from 'vs/workbench/parts/execution/common/execution';
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
 
-const enum ShellType { cmd, powershell, bash };
+const enum ShellType { cmd, powershell, bash }
 
 export class TerminalSupport {
 
@@ -24,11 +25,6 @@ export class TerminalSupport {
 			return nativeTerminalService.runInTerminal(args.title, args.cwd, args.args, args.env || {});
 		}
 
-		let delay = 0;
-		if (!TerminalSupport.integratedTerminalInstance) {
-			TerminalSupport.integratedTerminalInstance = terminalService.createInstance({ name: args.title || nls.localize('debug.terminal.title', "debuggee") });
-			delay = 2000;	// delay the first sendText so that the newly created terminal is ready.
-		}
 		if (!TerminalSupport.terminalDisposedListener) {
 			// React on terminal disposed and check if that is the debug terminal #12956
 			TerminalSupport.terminalDisposedListener = terminalService.onInstanceDisposed(terminal => {
@@ -37,22 +33,49 @@ export class TerminalSupport {
 				}
 			});
 		}
-		terminalService.setActiveInstance(TerminalSupport.integratedTerminalInstance);
+
+		let t = TerminalSupport.integratedTerminalInstance;
+		if ((t && this.isBusy(t)) || !t) {
+			t = terminalService.createInstance({ name: args.title || nls.localize('debug.terminal.title', "debuggee") });
+			TerminalSupport.integratedTerminalInstance = t;
+		}
+		terminalService.setActiveInstance(t);
 		terminalService.showPanel(true);
 
-		return new TPromise<void>((c, e) => {
+		const command = this.prepareCommand(args, configurationService);
+		t.sendText(command, true);
 
-			setTimeout(() => {
-				if (TerminalSupport.integratedTerminalInstance) {
-					const command = this.prepareCommand(args, configurationService);
-					TerminalSupport.integratedTerminalInstance.sendText(command, true);
-					c(void 0);
+		return TPromise.as(void 0);
+	}
+
+	private static isBusy(t: ITerminalInstance): boolean {
+		if (t.processId) {
+			try {
+				// if shell has at least one child process, assume that shell is busy
+				if (platform.isWindows) {
+					const result = cp.spawnSync('wmic', ['process', 'get', 'ParentProcessId']);
+					if (result.stdout) {
+						const pids = result.stdout.toString().split('\r\n');
+						if (!pids.some(p => parseInt(p) === t.processId)) {
+							return false;
+						}
+					}
 				} else {
-					e(new Error(nls.localize('debug.terminal.not.available.error', "Integrated terminal not available")));
+					const result = cp.spawnSync('/usr/bin/pgrep', ['-lP', String(t.processId)]);
+					if (result.stdout) {
+						const r = result.stdout.toString().trim();
+						if (r.length === 0 || r.indexOf(' tmux') >= 0) { // ignore 'tmux'; see #43683
+							return false;
+						}
+					}
 				}
-			}, delay);
-
-		});
+			}
+			catch (e) {
+				// silently ignore
+			}
+		}
+		// fall back to safe side
+		return true;
 	}
 
 	private static prepareCommand(args: DebugProtocol.RunInTerminalRequestArguments, configurationService: IConfigurationService): string {
@@ -61,7 +84,7 @@ export class TerminalSupport {
 
 		// get the shell configuration for the current platform
 		let shell: string;
-		const shell_config = (<ITerminalConfiguration>configurationService.getConfiguration<any>().terminal.integrated).shell;
+		const shell_config = (<ITerminalConfiguration>configurationService.getValue<any>().terminal.integrated).shell;
 		if (platform.isWindows) {
 			shell = shell_config.windows;
 			shellType = ShellType.cmd;
@@ -94,7 +117,8 @@ export class TerminalSupport {
 
 				quote = (s: string) => {
 					s = s.replace(/\'/g, '\'\'');
-					return s.indexOf(' ') >= 0 || s.indexOf('\'') >= 0 || s.indexOf('"') >= 0 ? `'${s}'` : s;
+					return `'${s}'`;
+					//return s.indexOf(' ') >= 0 || s.indexOf('\'') >= 0 || s.indexOf('"') >= 0 ? `'${s}'` : s;
 				};
 
 				if (args.cwd) {
@@ -102,7 +126,12 @@ export class TerminalSupport {
 				}
 				if (args.env) {
 					for (let key in args.env) {
-						command += `$env:${key}='${args.env[key]}'; `;
+						const value = args.env[key];
+						if (value === null) {
+							command += `Remove-Item env:${key}; `;
+						} else {
+							command += `\${env:${key}}='${value}'; `;
+						}
 					}
 				}
 				if (args.args && args.args.length > 0) {
@@ -127,7 +156,12 @@ export class TerminalSupport {
 				if (args.env) {
 					command += 'cmd /C "';
 					for (let key in args.env) {
-						command += `set "${key}=${args.env[key]}" && `;
+						const value = args.env[key];
+						if (value === null) {
+							command += `set "${key}=" && `;
+						} else {
+							command += `set "${key}=${args.env[key]}" && `;
+						}
 					}
 				}
 				for (let a of args.args) {
@@ -151,7 +185,12 @@ export class TerminalSupport {
 				if (args.env) {
 					command += 'env';
 					for (let key in args.env) {
-						command += ` "${key}=${args.env[key]}"`;
+						const value = args.env[key];
+						if (value === null) {
+							command += ` -u "${key}"`;
+						} else {
+							command += ` "${key}=${value}"`;
+						}
 					}
 					command += ' ';
 				}

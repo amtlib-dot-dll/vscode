@@ -5,17 +5,14 @@
 'use strict';
 
 import Event from 'vs/base/common/event';
-import platform = require('vs/base/common/platform');
 import { IDisposable } from 'vs/base/common/lifecycle';
-import { RawContextKey, ContextKeyExpr } from 'vs/platform/contextkey/common/contextkey';
+import { RawContextKey, ContextKeyExpr, IContextKey } from 'vs/platform/contextkey/common/contextkey';
 import { TPromise } from 'vs/base/common/winjs.base';
 import { createDecorator } from 'vs/platform/instantiation/common/instantiation';
 
 export const TERMINAL_PANEL_ID = 'workbench.panel.terminal';
 
 export const TERMINAL_SERVICE_ID = 'terminalService';
-
-export const TERMINAL_DEFAULT_RIGHT_CLICK_COPY_PASTE = platform.isWindows;
 
 /**  A context key that is set when the integrated terminal has focus. */
 export const KEYBINDING_CONTEXT_TERMINAL_FOCUS = new RawContextKey<boolean>('terminalFocus', undefined);
@@ -47,6 +44,10 @@ export const TerminalCursorStyle = {
 	UNDERLINE: 'underline'
 };
 
+export const TERMINAL_CONFIG_SECTION = 'terminal.integrated';
+
+export type FontWeight = 'normal' | 'bold' | '100' | '200' | '300' | '400' | '500' | '600' | '700' | '800' | '900';
+
 export interface ITerminalConfiguration {
 	shell: {
 		linux: string;
@@ -58,11 +59,13 @@ export interface ITerminalConfiguration {
 		osx: string[];
 		windows: string[];
 	};
-	// enableBold: boolean;
-	rightClickCopyPaste: boolean;
+	macOptionIsMeta: boolean;
+	rightClickBehavior: 'default' | 'copyPaste' | 'selectWord';
 	cursorBlinking: boolean;
 	cursorStyle: string;
 	fontFamily: string;
+	fontWeight: FontWeight;
+	fontWeightBold: FontWeight;
 	// fontLigatures: boolean;
 	fontSize: number;
 	lineHeight: number;
@@ -71,11 +74,14 @@ export interface ITerminalConfiguration {
 	commandsToSkipShell: string[];
 	cwd: string;
 	confirmOnExit: boolean;
+	enableBell: boolean;
 	env: {
 		linux: { [key: string]: string };
 		osx: { [key: string]: string };
 		windows: { [key: string]: string };
 	};
+	showExitAlert: boolean;
+	experimentalRestore: boolean;
 }
 
 export interface ITerminalConfigHelper {
@@ -93,8 +99,8 @@ export interface ITerminalFont {
 	fontFamily: string;
 	fontSize: number;
 	lineHeight: number;
-	charWidth: number;
-	charHeight: number;
+	charWidth?: number;
+	charHeight?: number;
 }
 
 export interface IShellLaunchConfig {
@@ -139,26 +145,31 @@ export interface IShellLaunchConfig {
 export interface ITerminalService {
 	_serviceBrand: any;
 
-	activeTerminalInstanceIndex: number;
+	activeTabIndex: number;
 	configHelper: ITerminalConfigHelper;
-	onActiveInstanceChanged: Event<string>;
+	onActiveTabChanged: Event<void>;
+	onTabDisposed: Event<ITerminalTab>;
 	onInstanceDisposed: Event<ITerminalInstance>;
 	onInstanceProcessIdReady: Event<ITerminalInstance>;
-	onInstanceData: Event<{ instance: ITerminalInstance, data: string }>;
-	onInstancesChanged: Event<string>;
+	onInstancesChanged: Event<void>;
 	onInstanceTitleChanged: Event<string>;
 	terminalInstances: ITerminalInstance[];
+	terminalTabs: ITerminalTab[];
 
 	createInstance(shell?: IShellLaunchConfig, wasNewTerminalAction?: boolean): ITerminalInstance;
 	getInstanceFromId(terminalId: number): ITerminalInstance;
 	getInstanceFromIndex(terminalIndex: number): ITerminalInstance;
-	getInstanceLabels(): string[];
+	getTabLabels(): string[];
 	getActiveInstance(): ITerminalInstance;
 	setActiveInstance(terminalInstance: ITerminalInstance): void;
 	setActiveInstanceByIndex(terminalIndex: number): void;
-	setActiveInstanceToNext(): void;
-	setActiveInstanceToPrevious(): void;
 	getActiveOrCreateInstance(wasNewTerminalAction?: boolean): ITerminalInstance;
+	splitInstance(instance: ITerminalInstance): void;
+
+	getActiveTab(): ITerminalTab;
+	setActiveTabToNext(): void;
+	setActiveTabToPrevious(): void;
+	setActiveTabByIndex(tabIndex: number): void;
 
 	showPanel(focus?: boolean): TPromise<void>;
 	hidePanel(): void;
@@ -168,9 +179,33 @@ export interface ITerminalService {
 	showPreviousFindTermFindWidget(): void;
 
 	setContainers(panelContainer: HTMLElement, terminalContainer: HTMLElement): void;
-	updateConfig(): void;
 	selectDefaultWindowsShell(): TPromise<string>;
 	setWorkspaceShellAllowed(isAllowed: boolean): void;
+}
+
+export const enum Direction {
+	Left = 0,
+	Right = 1,
+	Up = 2,
+	Down = 3
+}
+
+export interface ITerminalTab {
+	activeInstance: ITerminalInstance;
+	terminalInstances: ITerminalInstance[];
+	title: string;
+	onDisposed: Event<ITerminalTab>;
+	onInstancesChanged: Event<void>;
+
+	focusPreviousPane(): void;
+	focusNextPane(): void;
+	resizePane(direction: Direction): void;
+	setActiveInstanceByIndex(index: number): void;
+	attachToElement(element: HTMLElement): void;
+	setVisible(visible: boolean): void;
+	layout(width: number, height: number): void;
+	addDisposable(disposable: IDisposable): void;
+	split(terminalFocusContextKey: IContextKey<boolean>, configHelper: ITerminalConfigHelper, shellLaunchConfig: IShellLaunchConfig): ITerminalInstance;
 }
 
 export interface ITerminalInstance {
@@ -195,6 +230,10 @@ export interface ITerminalInstance {
 	 */
 	onDisposed: Event<ITerminalInstance>;
 
+	onFocused: Event<ITerminalInstance>;
+
+	onProcessIdReady: Event<ITerminalInstance>;
+
 	/**
 	 * The title of the terminal. This is either title or the process currently running or an
 	 * explicit name given to the terminal instance through the extension API.
@@ -217,6 +256,11 @@ export interface ITerminalInstance {
 	isTitleSetByProcess: boolean;
 
 	/**
+	 * The shell launch config used to launch the shell.
+	 */
+	shellLaunchConfig: IShellLaunchConfig;
+
+	/**
 	 * Dispose the terminal instance, removing it from the panel/service and freeing up resources.
 	 */
 	dispose(): void;
@@ -232,7 +276,7 @@ export interface ITerminalInstance {
 	 * added to the DOM.
 	 * @return The ID of the new matcher, this can be used to deregister.
 	 */
-	registerLinkMatcher(regex: RegExp, handler: (url: string) => void, matchIndex?: number, validationCallback?: (uri: string, element: HTMLElement, callback: (isValid: boolean) => void) => void): number;
+	registerLinkMatcher(regex: RegExp, handler: (url: string) => void, matchIndex?: number, validationCallback?: (uri: string, callback: (isValid: boolean) => void) => void): number;
 
 	/**
 	 * Deregisters a link matcher if it has been registered.
@@ -336,6 +380,12 @@ export interface ITerminalInstance {
 	updateConfig(): void;
 
 	/**
+	 * Updates the accessibility support state of the terminal instance.
+	 * @param isEnabled Whether it's enabled.
+	 */
+	updateAccessibilitySupport(isEnabled: boolean): void;
+
+	/**
 	 * Configure the dimensions of the terminal instance.
 	 *
 	 * @param dimension The dimensions of the container.
@@ -350,12 +400,16 @@ export interface ITerminalInstance {
 	setVisible(visible: boolean): void;
 
 	/**
-	 * Attach a listener to the data stream from the terminal's pty process.
+	 * Attach a listener to listen for new lines added to this terminal instance.
 	 *
-	 * @param listener The listener function which takes the processes' data stream (including
-	 * ANSI escape sequences).
+	 * @param listener The listener function which takes new line strings added to the terminal,
+	 * excluding ANSI escape sequences. The line event will fire when an LF character is added to
+	 * the terminal (ie. the line is not wrapped). Note that this means that the line data will
+	 * not fire for the last line, until either the line is ended with a LF character of the process
+	 * is exited. The lineData string will contain the fully wrapped line, not containing any LF/CR
+	 * characters.
 	 */
-	onData(listener: (data: string) => void): IDisposable;
+	onLineData(listener: (lineData: string) => void): IDisposable;
 
 	/**
 	 * Attach a listener that fires when the terminal's pty process exits.
@@ -376,4 +430,6 @@ export interface ITerminalInstance {
 	 * Sets the title of the terminal instance.
 	 */
 	setTitle(title: string, eventFromProcess: boolean): void;
+
+	addDisposable(disposable: IDisposable): void;
 }

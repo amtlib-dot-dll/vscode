@@ -12,6 +12,7 @@
 	var firstLoad = true;
 	var loadTimeout;
 	var pendingMessages = [];
+	var enableWrappedPostMessage = false;
 
 	const initData = {
 		initialScrollProgress: undefined
@@ -46,25 +47,36 @@
 		if (!event || !event.view || !event.view.document) {
 			return;
 		}
+
+		var baseElement = event.view.document.getElementsByTagName('base')[0];
 		/** @type {any} */
 		var node = event.target;
 		while (node) {
 			if (node.tagName && node.tagName.toLowerCase() === 'a' && node.href) {
-				var baseElement = event.view.document.getElementsByTagName("base")[0];
-				if (node.getAttribute("href") === "#") {
+				if (node.getAttribute('href') === '#') {
 					event.view.scrollTo(0, 0);
-				} else if (node.hash && (node.getAttribute("href") === node.hash || (baseElement && node.href.indexOf(baseElement.href) >= 0))) {
+				} else if (node.hash && (node.getAttribute('href') === node.hash || (baseElement && node.href.indexOf(baseElement.href) >= 0))) {
 					var scrollTarget = event.view.document.getElementById(node.hash.substr(1, node.hash.length - 1));
 					if (scrollTarget) {
 						scrollTarget.scrollIntoView();
 					}
 				} else {
-					ipcRenderer.sendToHost("did-click-link", node.href);
+					ipcRenderer.sendToHost('did-click-link', node.href);
 				}
 				event.preventDefault();
 				break;
 			}
 			node = node.parentNode;
+		}
+	}
+
+	function onMessage(message) {
+		if (enableWrappedPostMessage) {
+			// Modern webview. Forward wrapped message
+			ipcRenderer.sendToHost('onmessage', message.data);
+		} else {
+			// Old school webview. Forward exact message
+			ipcRenderer.sendToHost(message.data.command, message.data.data);
 		}
 	}
 
@@ -95,8 +107,8 @@
 			initData.baseUrl = value;
 		});
 
-		ipcRenderer.on('styles', function (event, value, activeTheme) {
-			initData.styles = value;
+		ipcRenderer.on('styles', function (event, variables, activeTheme) {
+			initData.styles = variables;
 			initData.activeTheme = activeTheme;
 
 			// webview
@@ -108,10 +120,9 @@
 			styleBody(body[0]);
 
 			// iframe
-			var defaultStyles = target.contentDocument.getElementById('_defaultStyles');
-			if (defaultStyles) {
-				defaultStyles.innerHTML = initData.styles;
-			}
+			Object.keys(variables).forEach(function (variable) {
+				target.contentDocument.documentElement.style.setProperty(`--${variable}`, variables[variable]);
+			});
 		});
 
 		// propagate focus
@@ -125,8 +136,16 @@
 		// update iframe-contents
 		ipcRenderer.on('content', function (_event, data) {
 			const options = data.options;
-			const text = data.contents.join('\n');
+			enableWrappedPostMessage = options && options.enableWrappedPostMessage;
+
+			const text = data.contents;
 			const newDocument = new DOMParser().parseFromString(text, 'text/html');
+
+			newDocument.querySelectorAll('a').forEach(a => {
+				if (!a.title) {
+					a.title = a.href;
+				}
+			});
 
 			// set base-url if applicable
 			if (initData.baseUrl && newDocument.head.getElementsByTagName('base').length === 0) {
@@ -138,7 +157,74 @@
 			// apply default styles
 			const defaultStyles = newDocument.createElement('style');
 			defaultStyles.id = '_defaultStyles';
-			defaultStyles.innerHTML = initData.styles;
+
+			const vars = Object.keys(initData.styles || {}).map(function (variable) {
+				return `--${variable}: ${initData.styles[variable]};`;
+			});
+			defaultStyles.innerHTML = `
+			:root { ${vars.join(' ')} }
+
+			body {
+				background-color: var(--background-color);
+				color: var(--color);
+				font-family: var(--font-family);
+				font-weight: var(--font-weight);
+				font-size: var(--font-size);
+				margin: 0;
+				padding: 0 20px;
+			}
+
+			img {
+				max-width: 100%;
+				max-height: 100%;
+			}
+
+			body a {
+				color: var(--link-color);
+			}
+
+			a:focus,
+			input:focus,
+			select:focus,
+			textarea:focus {
+				outline: 1px solid -webkit-focus-ring-color;
+				outline-offset: -1px;
+			}
+			::-webkit-scrollbar {
+				width: 10px;
+				height: 10px;
+			}
+
+			::-webkit-scrollbar-thumb {
+				background-color: rgba(121, 121, 121, 0.4);
+			}
+			body.vscode-light::-webkit-scrollbar-thumb {
+				background-color: rgba(100, 100, 100, 0.4);
+			}
+			body.vscode-high-contrast::-webkit-scrollbar-thumb {
+				background-color: rgba(111, 195, 223, 0.3);
+			}
+
+			::-webkit-scrollbar-thumb:hover {
+				background-color: rgba(100, 100, 100, 0.7);
+			}
+			body.vscode-light::-webkit-scrollbar-thumb:hover {
+				background-color: rgba(100, 100, 100, 0.7);
+			}
+			body.vscode-high-contrast::-webkit-scrollbar-thumb:hover {
+				background-color: rgba(111, 195, 223, 0.8);
+			}
+
+			::-webkit-scrollbar-thumb:active {
+				background-color: rgba(85, 85, 85, 0.8);
+			}
+			body.vscode-light::-webkit-scrollbar-thumb:active {
+				background-color: rgba(0, 0, 0, 0.6);
+			}
+			body.vscode-high-contrast::-webkit-scrollbar-thumb:active {
+				background-color: rgba(111, 195, 223, 0.8);
+			}
+			`;
 			if (newDocument.head.hasChildNodes()) {
 				newDocument.head.insertBefore(defaultStyles, newDocument.head.firstChild);
 			} else {
@@ -181,7 +267,7 @@
 			newFrame.setAttribute('id', 'pending-frame');
 			newFrame.setAttribute('frameborder', '0');
 			newFrame.setAttribute('sandbox', options.allowScripts ? 'allow-scripts allow-forms allow-same-origin' : 'allow-same-origin');
-			newFrame.style.cssText = "display: block; margin: 0; overflow: hidden; position: absolute; width: 100%; height: 100%; visibility: hidden";
+			newFrame.style.cssText = 'display: block; margin: 0; overflow: hidden; position: absolute; width: 100%; height: 100%; visibility: hidden';
 			document.body.appendChild(newFrame);
 
 			// write new content onto iframe
@@ -211,8 +297,8 @@
 					newFrame.style.visibility = 'visible';
 					contentWindow.addEventListener('scroll', handleInnerScroll);
 
-					pendingMessages.forEach(function(data) {
-						contentWindow.postMessage(data, document.location.origin);
+					pendingMessages.forEach(function (data) {
+						contentWindow.postMessage(data, '*');
 					});
 					pendingMessages = [];
 				}
@@ -251,7 +337,7 @@
 			} else {
 				const target = getActiveFrame();
 				if (target) {
-					target.contentWindow.postMessage(data, document.location.origin);
+					target.contentWindow.postMessage(data, '*');
 				}
 			}
 		});
@@ -260,10 +346,8 @@
 			initData.initialScrollProgress = progress;
 		});
 
-		// forward messages from the embedded iframe
-		window.onmessage = function (message) {
-			ipcRenderer.sendToHost(message.data.command, message.data.data);
-		};
+		// Forward messages from the embedded iframe
+		window.onmessage = onMessage;
 
 		// signal ready
 		ipcRenderer.sendToHost('webview-ready', process.pid);

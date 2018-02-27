@@ -11,6 +11,7 @@ import * as objects from 'vs/base/common/objects';
 import { IDisposable, dispose, toDisposable } from 'vs/base/common/lifecycle';
 import Event, { Emitter } from 'vs/base/common/event';
 import * as json from 'vs/base/common/json';
+import * as extfs from 'vs/base/node/extfs';
 
 export interface IConfigurationChangeEvent<T> {
 	config: T;
@@ -150,21 +151,16 @@ export class ConfigWatcher<T> implements IConfigWatcher<T>, IDisposable {
 			return; // avoid watchers that will never get disposed by checking for being disposed
 		}
 
-		try {
-			const watcher = fs.watch(path);
-			watcher.on('change', (type, file) => this.onConfigFileChange(type, file.toString(), isParentFolder));
-			watcher.on('error', (code, signal) => this.options.onError(`Error watching ${path} for configuration changes (${code}, ${signal})`));
+		const watcher = extfs.watch(path,
+			(type, file) => this.onConfigFileChange(type, file, isParentFolder),
+			(error: string) => this.options.onError(error)
+		);
 
+		if (watcher) {
 			this.disposables.push(toDisposable(() => {
 				watcher.removeAllListeners();
 				watcher.close();
 			}));
-		} catch (error) {
-			fs.exists(path, exists => {
-				if (exists) {
-					this.options.onError(`Failed to watch ${path} for configuration changes (${error.toString()})`);
-				}
-			});
 		}
 	}
 
@@ -209,7 +205,7 @@ export class ConfigWatcher<T> implements IConfigWatcher<T>, IDisposable {
 			return fallback;
 		}
 
-		const value = this.cache ? this.cache[key] : void 0;
+		const value = this.cache ? (this.cache as any)[key] : void 0;
 
 		return typeof value !== 'undefined' ? value : fallback;
 	}

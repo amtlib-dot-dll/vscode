@@ -21,25 +21,25 @@ import { isMacintosh } from 'vs/base/common/platform';
 import { IWorkbenchEditorService } from 'vs/workbench/services/editor/common/editorService';
 import { Position, POSITIONS } from 'vs/platform/editor/common/editor';
 import { IEditorGroupService, IEditorTabOptions, GroupArrangement, GroupOrientation } from 'vs/workbench/services/group/common/groupService';
-import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
 import { ServiceCollection } from 'vs/platform/instantiation/common/serviceCollection';
 import { IContextKeyService } from 'vs/platform/contextkey/common/contextkey';
-import { IExtensionService } from 'vs/platform/extensions/common/extensions';
+import { IExtensionService } from 'vs/workbench/services/extensions/common/extensions';
+import { IStorageService, StorageScope } from 'vs/platform/storage/common/storage';
 import { TabsTitleControl } from 'vs/workbench/browser/parts/editor/tabsTitleControl';
-import { TitleControl, ITitleAreaControl, handleWorkspaceExternalDrop } from 'vs/workbench/browser/parts/editor/titleControl';
+import { ITitleAreaControl } from 'vs/workbench/browser/parts/editor/titleControl';
 import { NoTabsTitleControl } from 'vs/workbench/browser/parts/editor/noTabsTitleControl';
-import { IEditorStacksModel, IStacksModelChangeEvent, IEditorGroup, EditorOptions, TextEditorOptions, IEditorIdentifier } from 'vs/workbench/common/editor';
-import { extractResources } from 'vs/base/browser/dnd';
-import { IWindowService, IWindowsService } from 'vs/platform/windows/common/windows';
-import { getCodeEditor } from 'vs/editor/common/services/codeEditorService';
+import { IEditorStacksModel, IStacksModelChangeEvent, IEditorGroup, EditorOptions, TextEditorOptions, IEditorIdentifier, EditorInput } from 'vs/workbench/common/editor';
+import { getCodeEditor } from 'vs/editor/browser/services/codeEditorService';
 import { IThemeService } from 'vs/platform/theme/common/themeService';
 import { editorBackground, contrastBorder, activeContrastBorder } from 'vs/platform/theme/common/colorRegistry';
 import { Themable, EDITOR_GROUP_HEADER_TABS_BACKGROUND, EDITOR_GROUP_HEADER_NO_TABS_BACKGROUND, EDITOR_GROUP_BORDER, EDITOR_DRAG_AND_DROP_BACKGROUND, EDITOR_GROUP_BACKGROUND, EDITOR_GROUP_HEADER_TABS_BORDER } from 'vs/workbench/common/theme';
 import { attachProgressBarStyler } from 'vs/platform/theme/common/styler';
-import { IMessageService } from 'vs/platform/message/common/message';
-import { IFileService } from 'vs/platform/files/common/files';
-import { IWorkspacesService } from 'vs/platform/workspaces/common/workspaces';
+import { IDisposable } from 'vs/base/common/lifecycle';
+import { ResourcesDropHandler, LocalSelectionTransfer, DraggedEditorIdentifier } from 'vs/workbench/browser/dnd';
+import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
+import { IPartService } from 'vs/workbench/services/part/common/partService';
+import { TextDiffEditor } from 'vs/workbench/browser/parts/editor/textDiffEditor';
 
 export enum Rochade {
 	NONE,
@@ -73,6 +73,7 @@ export interface IEditorGroupsControl {
 	getInstantiationService(position: Position): IInstantiationService;
 	getProgressBar(position: Position): ProgressBar;
 	updateProgress(position: Position, state: ProgressState): void;
+	updateTitleAreas(refreshActive?: boolean): void;
 
 	layout(dimension: Dimension): void;
 	layout(position: Position): void;
@@ -86,8 +87,12 @@ export interface IEditorGroupsControl {
 
 	getRatio(): number[];
 
-
 	dispose(): void;
+}
+
+interface CenteredEditorLayoutData {
+	leftMarginRatio: number;
+	size: number;
 }
 
 /**
@@ -95,17 +100,22 @@ export interface IEditorGroupsControl {
  */
 export class EditorGroupsControl extends Themable implements IEditorGroupsControl, IVerticalSashLayoutProvider, IHorizontalSashLayoutProvider {
 
-	private static TITLE_AREA_CONTROL_KEY = '__titleAreaControl';
-	private static PROGRESS_BAR_CONTROL_KEY = '__progressBar';
-	private static INSTANTIATION_SERVICE_KEY = '__instantiationService';
+	private static readonly CENTERED_EDITOR_LAYOUT_DATA_STORAGE_KEY = 'workbench.centerededitorlayout.layoutData';
 
-	private static MIN_EDITOR_WIDTH = 170;
-	private static MIN_EDITOR_HEIGHT = 70;
+	private static readonly TITLE_AREA_CONTROL_KEY = '__titleAreaControl';
+	private static readonly PROGRESS_BAR_CONTROL_KEY = '__progressBar';
+	private static readonly INSTANTIATION_SERVICE_KEY = '__instantiationService';
 
-	private static EDITOR_TITLE_HEIGHT = 35;
+	private static readonly GOLDEN_RATIO = 0.61;
+	private static readonly MIN_EDITOR_WIDTH = 170;
+	private static readonly MIN_EDITOR_HEIGHT = 70;
 
-	private static SNAP_TO_MINIMIZED_THRESHOLD_WIDTH = 50;
-	private static SNAP_TO_MINIMIZED_THRESHOLD_HEIGHT = 20;
+	private static readonly EDITOR_TITLE_HEIGHT = 35;
+
+	private static readonly CENTERED_EDITOR_MIN_MARGIN = 10;
+
+	private static readonly SNAP_TO_MINIMIZED_THRESHOLD_WIDTH = 50;
+	private static readonly SNAP_TO_MINIMIZED_THRESHOLD_HEIGHT = 20;
 
 	private stacks: IEditorStacksModel;
 
@@ -128,33 +138,48 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 	private sashTwo: Sash;
 	private startSiloThreeSize: number;
 
+	// if the centered editor layout is activated, the editor inside of silo ONE is centered
+	// the silo will then contain:
+	// [left margin]|[editor]|[right margin]
+	// - The size of the editor is defined by centeredEditorSize
+	// - The position is defined by the ratio centeredEditorLeftMarginRatio = left-margin/(left-margin + editor + right-margin).
+	// - The two sashes can be used to control the size and position of the editor inside of the silo.
+	// - In order to seperate the two sashes from the sashes that control the size of bordering widgets
+	//   CENTERED_EDITOR_MIN_MARGIN is forced as a minimum size for the two margins.
+	private centeredEditorActive: boolean;
+	private centeredEditorSashLeft: Sash;
+	private centeredEditorSashRight: Sash;
+	private centeredEditorPreferedSize: number;
+	private centeredEditorLeftMarginRatio: number;
+	private centeredEditorDragStartPosition: number;
+	private centeredEditorDragStartSize: number;
+
 	private visibleEditors: BaseEditor[];
 
 	private lastActiveEditor: BaseEditor;
 	private lastActivePosition: Position;
 
-	private visibleEditorFocusTrackers: DOM.IFocusTracker[];
+	private visibleEditorFocusTrackerDisposable: IDisposable[];
 
 	private _onGroupFocusChanged: Emitter<void>;
 
 	private onStacksChangeScheduler: RunOnceScheduler;
 	private stacksChangedBuffer: IStacksModelChangeEvent[];
 
+	private transfer = LocalSelectionTransfer.getInstance<DraggedEditorIdentifier>();
+
 	constructor(
 		parent: Builder,
 		groupOrientation: GroupOrientation,
 		@IWorkbenchEditorService private editorService: IWorkbenchEditorService,
 		@IEditorGroupService private editorGroupService: IEditorGroupService,
-		@ITelemetryService private telemetryService: ITelemetryService,
+		@IPartService private partService: IPartService,
+		@IStorageService private storageServise: IStorageService,
 		@IContextKeyService private contextKeyService: IContextKeyService,
 		@IExtensionService private extensionService: IExtensionService,
 		@IInstantiationService private instantiationService: IInstantiationService,
-		@IWindowService private windowService: IWindowService,
-		@IWindowsService private windowsService: IWindowsService,
 		@IThemeService themeService: IThemeService,
-		@IFileService private fileService: IFileService,
-		@IMessageService private messageService: IMessageService,
-		@IWorkspacesService private workspacesService: IWorkspacesService
+		@ITelemetryService private telemetryService: ITelemetryService
 	) {
 		super(themeService);
 
@@ -168,7 +193,7 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 		this.silosMinimized = [];
 
 		this.visibleEditors = [];
-		this.visibleEditorFocusTrackers = [];
+		this.visibleEditorFocusTrackerDisposable = [];
 
 		this._onGroupFocusChanged = new Emitter<void>();
 		this.toUnbind.push(this._onGroupFocusChanged);
@@ -222,11 +247,14 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 	private registerListeners(): void {
 		this.toUnbind.push(this.stacks.onModelChanged(e => this.onStacksChanged(e)));
 		this.toUnbind.push(this.editorGroupService.onTabOptionsChanged(options => this.updateTabOptions(options, true)));
-		this.extensionService.onReady().then(() => this.onExtensionsReady());
+		this.toUnbind.push(this.extensionService.onDidRegisterExtensions(() => this.onDidRegisterExtensions()));
 	}
 
 	private updateTabOptions(tabOptions: IEditorTabOptions, refresh?: boolean): void {
 		const tabCloseButton = this.tabOptions ? this.tabOptions.tabCloseButton : 'right';
+		const tabSizing = this.tabOptions ? this.tabOptions.tabSizing : 'fit';
+		const iconTheme = this.tabOptions ? this.tabOptions.iconTheme : 'vs-seti';
+
 		this.tabOptions = tabOptions;
 
 		if (!refresh) {
@@ -263,8 +291,13 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 					this.createTitleControl(this.stacks.groupAt(position), this.silos[position], titleContainer, this.getInstantiationService(position));
 				}
 
-				// Refresh title when icons change
-				else if (showingIcons !== this.tabOptions.showIcons || tabCloseButton !== this.tabOptions.tabCloseButton) {
+				// Refresh title when layout options change
+				else if (
+					showingIcons !== this.tabOptions.showIcons ||
+					tabCloseButton !== this.tabOptions.tabCloseButton ||
+					tabSizing !== this.tabOptions.tabSizing ||
+					iconTheme !== this.tabOptions.iconTheme
+				) {
 					titleControl.refresh();
 				}
 			}
@@ -274,7 +307,7 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 		});
 	}
 
-	private onExtensionsReady(): void {
+	private onDidRegisterExtensions(): void {
 
 		// Up to date title areas
 		POSITIONS.forEach(position => this.getTitleAreaControl(position).update());
@@ -417,13 +450,11 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 	private trackFocus(editor: BaseEditor, position: Position): void {
 
 		// In case there is a previous tracker on the position, dispose it first
-		if (this.visibleEditorFocusTrackers[position]) {
-			this.visibleEditorFocusTrackers[position].dispose();
+		if (this.visibleEditorFocusTrackerDisposable[position]) {
+			this.visibleEditorFocusTrackerDisposable[position].dispose();
 		}
 
-		// Track focus on editor container
-		this.visibleEditorFocusTrackers[position] = DOM.trackFocus(editor.getContainer().getHTMLElement());
-		this.visibleEditorFocusTrackers[position].addFocusListener(() => {
+		this.visibleEditorFocusTrackerDisposable[position] = editor.onDidFocus(() => {
 			this.onFocusGained(editor);
 		});
 	}
@@ -440,12 +471,6 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 			// Automatically maximize this position if it is minimized
 			if (this.isSiloMinimized(this.lastActivePosition)) {
-
-				// Log this fact in telemetry
-				if (this.telemetryService) {
-					this.telemetryService.publicLog('workbenchEditorMaximized');
-				}
-
 				let remainingSize = this.totalSize;
 				let layout = false;
 
@@ -623,9 +648,9 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 	private clearPosition(position: Position): void {
 
 		// Unregister Listeners
-		if (this.visibleEditorFocusTrackers[position]) {
-			this.visibleEditorFocusTrackers[position].dispose();
-			this.visibleEditorFocusTrackers[position] = null;
+		if (this.visibleEditorFocusTrackerDisposable[position]) {
+			this.visibleEditorFocusTrackerDisposable[position].dispose();
+			this.visibleEditorFocusTrackerDisposable[position] = null;
 		}
 
 		// Clear from active editors
@@ -646,9 +671,9 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 		editor.changePosition(to);
 
 		// Change data structures
-		const listeners = this.visibleEditorFocusTrackers[from];
-		this.visibleEditorFocusTrackers[to] = listeners;
-		this.visibleEditorFocusTrackers[from] = null;
+		const listeners = this.visibleEditorFocusTrackerDisposable[from];
+		this.visibleEditorFocusTrackerDisposable[to] = listeners;
+		this.visibleEditorFocusTrackerDisposable[from] = null;
 
 		const minimizedState = this.silosMinimized[from];
 		this.silosMinimized[to] = minimizedState;
@@ -732,7 +757,7 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 		// Change data structures
 		arrays.move(this.visibleEditors, from, to);
-		arrays.move(this.visibleEditorFocusTrackers, from, to);
+		arrays.move(this.visibleEditorFocusTrackerDisposable, from, to);
 		arrays.move(this.silosSize, from, to);
 		arrays.move(this.silosMinimized, from, to);
 
@@ -951,10 +976,10 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 		// Sash One
 		this.sashOne = new Sash(this.parent.getHTMLElement(), this, { baseSize: 5, orientation: this.layoutVertically ? Orientation.VERTICAL : Orientation.HORIZONTAL });
-		this.toUnbind.push(this.sashOne.addListener('start', () => this.onSashOneDragStart()));
-		this.toUnbind.push(this.sashOne.addListener('change', (e: ISashEvent) => this.onSashOneDrag(e)));
-		this.toUnbind.push(this.sashOne.addListener('end', () => this.onSashOneDragEnd()));
-		this.toUnbind.push(this.sashOne.addListener('reset', () => this.onSashOneReset()));
+		this.toUnbind.push(this.sashOne.onDidStart(() => this.onSashOneDragStart()));
+		this.toUnbind.push(this.sashOne.onDidChange((e: ISashEvent) => this.onSashOneDrag(e)));
+		this.toUnbind.push(this.sashOne.onDidEnd(() => this.onSashOneDragEnd()));
+		this.toUnbind.push(this.sashOne.onDidReset(() => this.onSashOneReset()));
 		this.sashOne.hide();
 
 		// Silo Two
@@ -962,10 +987,10 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 		// Sash Two
 		this.sashTwo = new Sash(this.parent.getHTMLElement(), this, { baseSize: 5, orientation: this.layoutVertically ? Orientation.VERTICAL : Orientation.HORIZONTAL });
-		this.toUnbind.push(this.sashTwo.addListener('start', () => this.onSashTwoDragStart()));
-		this.toUnbind.push(this.sashTwo.addListener('change', (e: ISashEvent) => this.onSashTwoDrag(e)));
-		this.toUnbind.push(this.sashTwo.addListener('end', () => this.onSashTwoDragEnd()));
-		this.toUnbind.push(this.sashTwo.addListener('reset', () => this.onSashTwoReset()));
+		this.toUnbind.push(this.sashTwo.onDidStart(() => this.onSashTwoDragStart()));
+		this.toUnbind.push(this.sashTwo.onDidChange((e: ISashEvent) => this.onSashTwoDrag(e)));
+		this.toUnbind.push(this.sashTwo.onDidEnd(() => this.onSashTwoDragEnd()));
+		this.toUnbind.push(this.sashTwo.onDidReset(() => this.onSashTwoReset()));
 		this.sashTwo.hide();
 
 		// Silo Three
@@ -973,39 +998,71 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 		// For each position
 		POSITIONS.forEach(position => {
-			const silo = this.silos[position];
-
-			// Containers (they contain everything and can move between silos)
-			const container = $(silo).div({ 'class': 'container' });
-
-			// InstantiationServices
-			const instantiationService = this.instantiationService.createChild(new ServiceCollection(
-				[IContextKeyService, this.contextKeyService.createScoped(container.getHTMLElement())]
-			));
-			container.setProperty(EditorGroupsControl.INSTANTIATION_SERVICE_KEY, instantiationService); // associate with container
-
-			// Title containers
-			const titleContainer = $(container).div({ 'class': 'title' });
-			if (this.tabOptions.showTabs) {
-				titleContainer.addClass('tabs');
-			}
-			if (this.tabOptions.showIcons) {
-				titleContainer.addClass('show-file-icons');
-			}
-			this.hookTitleDragListener(titleContainer);
-
-			// Title Control
-			this.createTitleControl(this.stacks.groupAt(position), silo, titleContainer, instantiationService);
-
-			// Progress Bar
-			const progressBar = new ProgressBar($(container));
-			this.toUnbind.push(attachProgressBarStyler(progressBar, this.themeService));
-			progressBar.getContainer().hide();
-			container.setProperty(EditorGroupsControl.PROGRESS_BAR_CONTROL_KEY, progressBar); // associate with container
+			this.createSilo(position);
 		});
 
 		// Update Styles
 		this.updateStyles();
+	}
+
+	private createSilo(position: Position): void {
+		const silo = this.silos[position];
+
+		// Containers (they contain everything and can move between silos)
+		const container = $(silo).div({ 'class': 'container' });
+
+		// InstantiationServices
+		const instantiationService = this.instantiationService.createChild(new ServiceCollection(
+			[IContextKeyService, this.contextKeyService.createScoped(container.getHTMLElement())]
+		));
+		container.setProperty(EditorGroupsControl.INSTANTIATION_SERVICE_KEY, instantiationService); // associate with container
+
+		// Title containers
+		const titleContainer = $(container).div({ 'class': 'title' });
+		if (this.tabOptions.showTabs) {
+			titleContainer.addClass('tabs');
+		}
+		if (this.tabOptions.showIcons) {
+			titleContainer.addClass('show-file-icons');
+		}
+		this.hookTitleDragListener(titleContainer);
+
+		// Title Control
+		this.createTitleControl(this.stacks.groupAt(position), silo, titleContainer, instantiationService);
+
+		// Progress Bar
+		const progressBar = new ProgressBar($(container));
+		this.toUnbind.push(attachProgressBarStyler(progressBar, this.themeService));
+		progressBar.getContainer().hide();
+		container.setProperty(EditorGroupsControl.PROGRESS_BAR_CONTROL_KEY, progressBar); // associate with container
+
+		// Sash for first position to support centered editor layout
+		if (position === Position.ONE) {
+
+			// Center Layout stuff
+			const registerSashListeners = (sash: Sash) => {
+				this.toUnbind.push(sash.onDidStart(() => this.onCenterSashDragStart()));
+				this.toUnbind.push(sash.onDidChange((e: ISashEvent) => this.onCenterSashDrag(sash, e)));
+				this.toUnbind.push(sash.onDidEnd(() => this.storeCenteredLayoutData()));
+				this.toUnbind.push(sash.onDidReset(() => this.resetCenteredEditor()));
+			};
+			this.centeredEditorSashLeft = new Sash(container.getHTMLElement(), this, { baseSize: 5, orientation: Orientation.VERTICAL });
+			this.centeredEditorSashRight = new Sash(container.getHTMLElement(), this, { baseSize: 5, orientation: Orientation.VERTICAL });
+			registerSashListeners(this.centeredEditorSashLeft);
+			registerSashListeners(this.centeredEditorSashRight);
+
+			this.centeredEditorActive = false;
+			this.centeredEditorLeftMarginRatio = 0.5;
+			this.centeredEditorPreferedSize = -1; // set this later if we know the container size
+
+			// Restore centered layout position and size
+			const centeredLayoutDataString = this.storageServise.get(EditorGroupsControl.CENTERED_EDITOR_LAYOUT_DATA_STORAGE_KEY, StorageScope.GLOBAL);
+			if (centeredLayoutDataString) {
+				const centeredLayout = <CenteredEditorLayoutData>JSON.parse(centeredLayoutDataString);
+				this.centeredEditorLeftMarginRatio = centeredLayout.leftMarginRatio;
+				this.centeredEditorPreferedSize = centeredLayout.size;
+			}
+		}
 	}
 
 	protected updateStyles(): void {
@@ -1067,8 +1124,17 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 			return options;
 		}
 
+		const isCopyDrag = (draggedEditor: IEditorIdentifier, e: DragEvent) => {
+			if (draggedEditor && draggedEditor.editor instanceof EditorInput) {
+				if (!draggedEditor.editor.supportsSplitEditor()) {
+					return false;
+				}
+			}
+			return (e.ctrlKey && !isMacintosh) || (e.altKey && isMacintosh);
+		};
+
 		function onDrop(e: DragEvent, position: Position, splitTo?: Position): void {
-			$this.updateFromDropping(node, false);
+			$this.updateFromDragAndDrop(node, false);
 			cleanUp();
 
 			const editorService = $this.editorService;
@@ -1078,9 +1144,9 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 			const freeGroup = (stacks.groups.length === 1) ? Position.TWO : Position.THREE;
 
 			// Check for transfer from title control
-			const draggedEditor = TitleControl.getDraggedEditor();
-			if (draggedEditor) {
-				const isCopy = (e.ctrlKey && !isMacintosh) || (e.altKey && isMacintosh);
+			if ($this.transfer.hasData(DraggedEditorIdentifier.prototype)) {
+				const draggedEditor = $this.transfer.getData(DraggedEditorIdentifier.prototype)[0].identifier;
+				const isCopy = isCopyDrag(draggedEditor, e);
 
 				// Copy editor to new location
 				if (isCopy) {
@@ -1118,44 +1184,22 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 			// Check for URI transfer
 			else {
-				const droppedResources = extractResources(e).filter(r => r.resource.scheme === 'file' || r.resource.scheme === 'untitled');
-				if (droppedResources.length) {
-					handleWorkspaceExternalDrop(droppedResources, $this.fileService, $this.messageService, $this.windowsService, $this.windowService, $this.workspacesService).then(handled => {
-						if (handled) {
-							return;
-						}
+				const dropHandler = $this.instantiationService.createInstance(ResourcesDropHandler, { allowWorkspaceOpen: true /* open workspace instead of file if dropped */ });
+				dropHandler.handleDrop(e, () => {
+					if (splitEditor && splitTo !== freeGroup) {
+						groupService.moveGroup(freeGroup, splitTo);
+					}
 
-						// Add external ones to recently open list
-						const externalResources = droppedResources.filter(d => d.isExternal).map(d => d.resource);
-						if (externalResources.length) {
-							$this.windowsService.addRecentlyOpened(externalResources.map(resource => resource.fsPath));
-						}
-
-						// Open in Editor
-						$this.windowService.focusWindow()
-							.then(() => editorService.openEditors(droppedResources.map(d => {
-								return {
-									input: { resource: d.resource, options: { pinned: true } },
-									position: splitEditor ? freeGroup : position
-								};
-							}))).then(() => {
-								if (splitEditor && splitTo !== freeGroup) {
-									groupService.moveGroup(freeGroup, splitTo);
-								}
-
-								groupService.focusGroup(splitEditor ? splitTo : position);
-							})
-							.done(null, errors.onUnexpectedError);
-					});
-				}
+					groupService.focusGroup(splitEditor ? splitTo : position);
+				}, splitEditor ? freeGroup : position);
 			}
 		}
 
 		function positionOverlay(e: DragEvent, groups: number, position: Position): void {
 			const target = <HTMLElement>e.target;
 			const overlayIsSplit = typeof overlay.getProperty(splitToPropertyKey) === 'number';
-			const isCopy = (e.ctrlKey && !isMacintosh) || (e.altKey && isMacintosh);
-			const draggedEditor = TitleControl.getDraggedEditor();
+			const draggedEditor = $this.transfer.hasData(DraggedEditorIdentifier.prototype) ? $this.transfer.getData(DraggedEditorIdentifier.prototype)[0].identifier : void 0;
+			const isCopy = isCopyDrag(draggedEditor, e);
 
 			const overlaySize = $this.layoutVertically ? target.clientWidth : target.clientHeight;
 			const splitThreshold = overlayIsSplit ? overlaySize / 5 : overlaySize / 10;
@@ -1260,7 +1304,7 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 							// update the dropEffect, otherwise it would look like a "move" operation. but only if we are
 							// not dragging a tab actually because there we support both moving as well as copying
-							if (!TabsTitleControl.getDraggedEditor()) {
+							if (!$this.transfer.hasData(DraggedEditorIdentifier.prototype)) {
 								e.dataTransfer.dropEffect = 'copy';
 							}
 
@@ -1294,14 +1338,14 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 				DOM.EventHelper.stop(e, true);
 				onDrop(e, Position.ONE);
 			} else {
-				this.updateFromDropping(node, false);
+				this.updateFromDragAndDrop(node, false);
 			}
 		}));
 
 		// Drag enter
 		let counter = 0; // see https://github.com/Microsoft/vscode/issues/14470
 		this.toUnbind.push(DOM.addDisposableListener(node, DOM.EventType.DRAG_ENTER, (e: DragEvent) => {
-			if (!TitleControl.getDraggedEditor()) {
+			if (!$this.transfer.hasData(DraggedEditorIdentifier.prototype)) {
 				// we used to check for the dragged resources here (via dnd.extractResources()) but this
 				// seems to be not possible on Linux and Windows where during DRAG_ENTER the resources
 				// are always undefined up until they are dropped when dragged from the tree. The workaround
@@ -1312,7 +1356,7 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 			}
 
 			counter++;
-			this.updateFromDropping(node, true);
+			this.updateFromDragAndDrop(node, true);
 
 			const target = <HTMLElement>e.target;
 			if (target) {
@@ -1322,7 +1366,7 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 				createOverlay(target);
 
 				if (overlay) {
-					this.updateFromDropping(node, false); // if we show an overlay, we can remove the drop feedback from the editor background
+					this.updateFromDragAndDrop(node, false); // if we show an overlay, we can remove the drop feedback from the editor background
 				}
 			}
 		}));
@@ -1331,7 +1375,7 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 		this.toUnbind.push(DOM.addDisposableListener(node, DOM.EventType.DRAG_LEAVE, (e: DragEvent) => {
 			counter--;
 			if (counter === 0) {
-				this.updateFromDropping(node, false);
+				this.updateFromDragAndDrop(node, false);
 			}
 		}));
 
@@ -1339,7 +1383,7 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 		[node, window].forEach(container => {
 			this.toUnbind.push(DOM.addDisposableListener(container, DOM.EventType.DRAG_END, (e: DragEvent) => {
 				counter = 0;
-				this.updateFromDropping(node, false);
+				this.updateFromDragAndDrop(node, false);
 				cleanUp();
 			}));
 		});
@@ -1546,6 +1590,14 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 				// Move to valid position if any
 				if (moveTo !== null) {
+					// TODO@Ben remove me after a while
+					/* __GDPR__
+						"editorGroupMoved" : {
+							"source" : { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
+							"to": { "classification": "SystemMetaData", "purpose": "FeatureInsight" }
+						}
+					*/
+					this.telemetryService.publicLog('editorGroupMoved', { source: position, to: moveTo });
 					this.editorGroupService.moveGroup(position, moveTo);
 				}
 
@@ -1589,16 +1641,18 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 		}
 	}
 
-	private updateFromDropping(element: HTMLElement, isDropping: boolean): void {
+	private updateFromDragAndDrop(element: HTMLElement, isDraggedOver: boolean): void {
 		const groupCount = this.stacks.groups.length;
-		const background = this.getColor(isDropping ? EDITOR_DRAG_AND_DROP_BACKGROUND : groupCount > 0 ? EDITOR_GROUP_BACKGROUND : null);
+		const background = this.getColor(isDraggedOver ? EDITOR_DRAG_AND_DROP_BACKGROUND : groupCount > 0 ? EDITOR_GROUP_BACKGROUND : null);
 		element.style.backgroundColor = background;
 
 		const activeContrastBorderColor = this.getColor(activeContrastBorder);
-		element.style.outlineColor = isDropping ? activeContrastBorderColor : null;
-		element.style.outlineStyle = isDropping && activeContrastBorderColor ? 'dashed' : null;
-		element.style.outlineWidth = isDropping && activeContrastBorderColor ? '2px' : null;
-		element.style.outlineOffset = isDropping && activeContrastBorderColor ? '-2px' : null;
+		element.style.outlineColor = isDraggedOver ? activeContrastBorderColor : null;
+		element.style.outlineStyle = isDraggedOver && activeContrastBorderColor ? 'dashed' : null;
+		element.style.outlineWidth = isDraggedOver && activeContrastBorderColor ? '2px' : null;
+		element.style.outlineOffset = isDraggedOver && activeContrastBorderColor ? '-2px' : null;
+
+		DOM.toggleClass(element, 'dragged-over', isDraggedOver);
 	}
 
 	private posSilo(pos: number, leftTop: string | number, rightBottom?: string | number, borderLeftTopWidth?: string | number): void {
@@ -1872,12 +1926,68 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 		this.sashTwo.layout();
 	}
 
+	private get centeredEditorAvailableSize(): number {
+		return this.silosSize[Position.ONE] - EditorGroupsControl.CENTERED_EDITOR_MIN_MARGIN * 2;
+	}
+
+	private get centeredEditorSize(): number {
+		return Math.min(this.centeredEditorAvailableSize, this.centeredEditorPreferedSize);
+	}
+
+	private get centeredEditorPosition(): number {
+		return EditorGroupsControl.CENTERED_EDITOR_MIN_MARGIN + this.centeredEditorLeftMarginRatio * (this.centeredEditorAvailableSize - this.centeredEditorSize);
+	}
+
+	private onCenterSashDragStart(): void {
+		this.centeredEditorDragStartPosition = this.centeredEditorPosition;
+		this.centeredEditorDragStartSize = this.centeredEditorSize;
+	}
+
+	private onCenterSashDrag(sash: Sash, e: ISashEvent): void {
+		const sashesCoupled = !e.altKey;
+		const delta = sash === this.centeredEditorSashLeft ? e.startX - e.currentX : e.currentX - e.startX;
+		const size = this.centeredEditorDragStartSize + (sashesCoupled ? 2 * delta : delta);
+		let position = this.centeredEditorDragStartPosition;
+		if (sash === this.centeredEditorSashLeft || sashesCoupled) {
+			position -= delta;
+		}
+
+		if (size > 3 * this.minSize) {
+			this.centeredEditorPreferedSize = size;
+			position -= EditorGroupsControl.CENTERED_EDITOR_MIN_MARGIN;
+			position = Math.min(position, this.centeredEditorAvailableSize - this.centeredEditorSize);
+			position = Math.max(0, position);
+			this.centeredEditorLeftMarginRatio = position / (this.centeredEditorAvailableSize - this.centeredEditorSize);
+
+			this.layoutContainers();
+		}
+	}
+
+	private storeCenteredLayoutData(): void {
+		const data: CenteredEditorLayoutData = {
+			leftMarginRatio: this.centeredEditorLeftMarginRatio,
+			size: this.centeredEditorSize
+		};
+		this.storageServise.store(EditorGroupsControl.CENTERED_EDITOR_LAYOUT_DATA_STORAGE_KEY, JSON.stringify(data), StorageScope.GLOBAL);
+	}
+
 	public getVerticalSashTop(sash: Sash): number {
 		return 0;
 	}
 
 	public getVerticalSashLeft(sash: Sash): number {
-		return sash === this.sashOne ? this.silosSize[Position.ONE] : this.silosSize[Position.TWO] + this.silosSize[Position.ONE];
+		switch (sash) {
+			case this.sashOne:
+				return this.silosSize[Position.ONE];
+			case this.sashTwo:
+				return this.silosSize[Position.TWO] + this.silosSize[Position.ONE];
+			case this.centeredEditorSashLeft:
+				return this.centeredEditorPosition;
+			case this.centeredEditorSashRight:
+				return this.centeredEditorPosition + this.centeredEditorSize;
+			default:
+				return 0;
+		}
 	}
 
 	public getVerticalSashHeight(sash: Sash): number {
@@ -2027,6 +2137,28 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 			}
 		});
 
+		// Layout centered Editor (only in vertical layout when one group is opened)
+		const doCentering = this.layoutVertically && this.stacks.groups.length === 1 && this.partService.isEditorLayoutCentered() && !(this.visibleEditors[Position.ONE] instanceof TextDiffEditor);
+		if (doCentering && !this.centeredEditorActive) {
+			this.centeredEditorSashLeft.show();
+			this.centeredEditorSashRight.show();
+
+			// no size set yet. Calculate a default value
+			if (this.centeredEditorPreferedSize === -1) {
+				this.resetCenteredEditor(false);
+			}
+		} else if (!doCentering && this.centeredEditorActive) {
+			this.centeredEditorSashLeft.hide();
+			this.centeredEditorSashRight.hide();
+		}
+		this.centeredEditorActive = doCentering;
+		this.silos[Position.ONE].setClass('centered', doCentering);
+
+		if (this.centeredEditorActive) {
+			this.centeredEditorSashLeft.layout();
+			this.centeredEditorSashRight.layout();
+		}
+
 		// Layout visible editors
 		POSITIONS.forEach(position => {
 			this.layoutEditor(position);
@@ -2034,7 +2166,9 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 		// Layout title controls
 		POSITIONS.forEach(position => {
-			this.getTitleAreaControl(position).layout();
+			const siloWidth = this.layoutVertically ? this.silosSize[position] : this.dimension.width;
+
+			this.getTitleAreaControl(position).layout(new Dimension(siloWidth, EditorGroupsControl.EDITOR_TITLE_HEIGHT));
 		});
 
 		// Update minimized state
@@ -2043,9 +2177,16 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 
 	private layoutEditor(position: Position): void {
 		const editorSize = this.silosSize[position];
-		if (editorSize && this.visibleEditors[position]) {
+		const editor = this.visibleEditors[position];
+		if (editorSize && editor) {
 			let editorWidth = this.layoutVertically ? editorSize : this.dimension.width;
 			let editorHeight = (this.layoutVertically ? this.dimension.height : this.silosSize[position]) - EditorGroupsControl.EDITOR_TITLE_HEIGHT;
+
+			let editorPosition = 0;
+			if (this.centeredEditorActive) {
+				editorWidth = this.centeredEditorSize;
+				editorPosition = this.centeredEditorPosition;
+			}
 
 			if (position !== Position.ONE) {
 				if (this.layoutVertically) {
@@ -2055,8 +2196,21 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 				}
 			}
 
-			this.visibleEditors[position].layout(new Dimension(editorWidth, editorHeight));
+			const editorContainer = editor.getContainer();
+			editorContainer.style('margin-left', this.centeredEditorActive ? `${editorPosition}px` : null);
+			editorContainer.style('width', this.centeredEditorActive ? `${editorWidth}px` : null);
+			editorContainer.style('border-color', this.centeredEditorActive ? this.getColor(EDITOR_GROUP_BORDER) || this.getColor(contrastBorder) : null);
+			editor.layout(new Dimension(editorWidth, editorHeight));
 		}
+	}
+
+	private resetCenteredEditor(layout: boolean = true) {
+		this.centeredEditorLeftMarginRatio = 0.5;
+		this.centeredEditorPreferedSize = Math.floor(this.dimension.width * EditorGroupsControl.GOLDEN_RATIO);
+		if (layout) {
+			this.layoutContainers();
+		}
+		this.storageServise.remove(EditorGroupsControl.CENTERED_EDITOR_LAYOUT_DATA_STORAGE_KEY, StorageScope.GLOBAL);
 	}
 
 	public getInstantiationService(position: Position): IInstantiationService {
@@ -2075,6 +2229,32 @@ export class EditorGroupsControl extends Themable implements IEditorGroupsContro
 		const silo = this.silos[position];
 
 		return silo ? silo.child().getProperty(key) : void 0;
+	}
+
+	public updateTitleAreas(refreshActive?: boolean): void {
+		POSITIONS.forEach(position => {
+			const group = this.stacks.groupAt(position);
+			if (!group) {
+				return;
+			}
+
+			const titleControl = this.getTitleAreaControl(position);
+			if (!titleControl) {
+				return;
+			}
+
+			// Make sure the active group is shown in the title
+			// and refresh it if we are instructed to refresh it
+			if (refreshActive && group.isActive) {
+				titleControl.setContext(group);
+				titleControl.refresh(true);
+			}
+
+			// Otherwise, just refresh the toolbar
+			else {
+				titleControl.updateEditorActionsToolbar();
+			}
+		});
 	}
 
 	public updateProgress(position: Position, state: ProgressState): void {

@@ -355,6 +355,7 @@
 		"editorCursor.foreground": "#D30102",
 		"editorWhitespace.foreground": "#93A1A180",
 		"editor.lineHighlightBackground": "#073642",
+		"editorActiveLineNumber.foreground": "#949494",
 		"editor.selectionBackground": "#073642",
 		// "editorIndentGuide.background": "",
 		"editorHoverWidget.background": "#004052",
@@ -371,9 +372,9 @@
 		// "editor.inactiveSelectionBackground": "",
 		// "editor.lineHighlightBorder": "",
 		// "editor.rangeHighlightBackground": "",
-		// "editor.selectionHighlightBackground": "",
-		// "editor.wordHighlightBackground": "",
-		// "editor.wordHighlightStrongBackground": "",
+		"editor.selectionHighlightBackground": "#005A6FAA",
+		"editor.wordHighlightBackground": "#004454AA",
+		"editor.wordHighlightStrongBackground": "#005A6FAA",
 
 		// Editor: Suggest
 		// "editorSuggestWidget.background": "",

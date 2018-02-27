@@ -1,5 +1,7 @@
 {
   "name": "configuration-editing",
+  "displayName": "%displayName%",
+  "description": "%description%",
   "version": "0.0.1",
   "publisher": "vscode",
   "engines": {
@@ -10,7 +12,8 @@
     "Other"
   ],
   "activationEvents": [
-    "onLanguage:json"
+    "onLanguage:json",
+    "onLanguage:jsonc"
   ],
   "main": "./out/extension",
   "scripts": {
@@ -18,8 +21,8 @@
     "watch": "gulp watch-extension:configuration-editing"
   },
   "dependencies": {
-    "jsonc-parser": "^0.3.1",
-    "vscode-nls": "^2.0.1"
+    "jsonc-parser": "^1.0.0",
+    "vscode-nls": "^3.2.1"
   },
   "contributes": {
     "jsonValidation": [
@@ -68,12 +71,16 @@
         "url": "vscode://schemas/snippets"
       },
       {
+        "fileMatch": "**/*.code-snippets",
+        "url": "vscode://schemas/global-snippets"
+      },
+      {
         "fileMatch": "/.vscode/extensions.json",
         "url": "vscode://schemas/extensions"
       }
     ]
   },
   "devDependencies": {
-    "@types/node": "^7.0.4"
+    "@types/node": "7.0.4"
   }
 }

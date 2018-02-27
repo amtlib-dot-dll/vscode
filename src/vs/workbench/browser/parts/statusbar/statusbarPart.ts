@@ -6,7 +6,6 @@
 'use strict';
 
 import 'vs/css!./media/statusbarpart';
-import dom = require('vs/base/browser/dom');
 import nls = require('vs/nls');
 import { toErrorMessage } from 'vs/base/common/errorMessage';
 import { TPromise } from 'vs/base/common/winjs.base';
@@ -17,13 +16,11 @@ import { Registry } from 'vs/platform/registry/common/platform';
 import { ICommandService } from 'vs/platform/commands/common/commands';
 import { IWorkbenchEditorService } from 'vs/workbench/services/editor/common/editorService';
 import { Part } from 'vs/workbench/browser/part';
-import { IWorkbenchActionRegistry, Extensions as ActionExtensions } from 'vs/workbench/common/actions';
 import { StatusbarAlignment, IStatusbarRegistry, Extensions, IStatusbarItem } from 'vs/workbench/browser/parts/statusbar/statusbar';
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
 import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
-import { IMessageService, Severity } from 'vs/platform/message/common/message';
 import { IStatusbarService, IStatusbarEntry } from 'vs/platform/statusbar/common/statusbar';
-import { getCodeEditor } from 'vs/editor/common/services/codeEditorService';
+import { getCodeEditor } from 'vs/editor/browser/services/codeEditorService';
 import { IContextMenuService } from 'vs/platform/contextview/browser/contextView';
 import { Action } from 'vs/base/common/actions';
 import { IThemeService, registerThemingParticipant, ITheme, ICssStyleCollector } from 'vs/platform/theme/common/themeService';
@@ -32,16 +29,20 @@ import { IWorkspaceContextService, WorkbenchState } from 'vs/platform/workspace/
 import { contrastBorder } from 'vs/platform/theme/common/colorRegistry';
 import { isThemeColor } from 'vs/editor/common/editorCommon';
 import { Color } from 'vs/base/common/color';
+import { addClass, EventHelper, createStyleSheet } from 'vs/base/browser/dom';
+import { INotificationService } from 'vs/platform/notification/common/notification';
 
 export class StatusbarPart extends Part implements IStatusbarService {
 
 	public _serviceBrand: any;
 
-	private static PRIORITY_PROP = 'priority';
-	private static ALIGNMENT_PROP = 'alignment';
+	private static readonly PRIORITY_PROP = 'priority';
+	private static readonly ALIGNMENT_PROP = 'alignment';
 
 	private statusItemsContainer: Builder;
 	private statusMsgDispose: IDisposable;
+
+	private styleElement: HTMLStyleElement;
 
 	constructor(
 		id: string,
@@ -61,7 +62,7 @@ export class StatusbarPart extends Part implements IStatusbarService {
 	public addEntry(entry: IStatusbarEntry, alignment: StatusbarAlignment, priority: number = 0): IDisposable {
 
 		// Render entry in status bar
-		const el = this.doCreateStatusItem(alignment, priority);
+		const el = this.doCreateStatusItem(alignment, priority, entry.showBeak ? 'has-beak' : void 0);
 		const item = this.instantiationService.createInstance(StatusBarEntryItem, entry);
 		const toDispose = item.render(el);
 
@@ -141,23 +142,36 @@ export class StatusbarPart extends Part implements IStatusbarService {
 
 		const container = this.getContainer();
 
+		// Background colors
+		const backgroundColor = this.getColor(this.contextService.getWorkbenchState() !== WorkbenchState.EMPTY ? STATUS_BAR_BACKGROUND : STATUS_BAR_NO_FOLDER_BACKGROUND);
+		container.style('background-color', backgroundColor);
 		container.style('color', this.getColor(this.contextService.getWorkbenchState() !== WorkbenchState.EMPTY ? STATUS_BAR_FOREGROUND : STATUS_BAR_NO_FOLDER_FOREGROUND));
-		container.style('background-color', this.getColor(this.contextService.getWorkbenchState() !== WorkbenchState.EMPTY ? STATUS_BAR_BACKGROUND : STATUS_BAR_NO_FOLDER_BACKGROUND));
 
+		// Border color
 		const borderColor = this.getColor(this.contextService.getWorkbenchState() !== WorkbenchState.EMPTY ? STATUS_BAR_BORDER : STATUS_BAR_NO_FOLDER_BORDER) || this.getColor(contrastBorder);
 		container.style('border-top-width', borderColor ? '1px' : null);
 		container.style('border-top-style', borderColor ? 'solid' : null);
 		container.style('border-top-color', borderColor);
+
+		// Notification Beak
+		if (!this.styleElement) {
+			this.styleElement = createStyleSheet(container.getHTMLElement());
+		}
+
+		this.styleElement.innerHTML = `.monaco-workbench > .part.statusbar > .statusbar-item.has-beak:before { border-bottom-color: ${backgroundColor}; }`;
 	}
 
-	private doCreateStatusItem(alignment: StatusbarAlignment, priority: number = 0): HTMLElement {
+	private doCreateStatusItem(alignment: StatusbarAlignment, priority: number = 0, extraClass?: string): HTMLElement {
 		const el = document.createElement('div');
-		dom.addClass(el, 'statusbar-item');
+		addClass(el, 'statusbar-item');
+		if (extraClass) {
+			addClass(el, extraClass);
+		}
 
 		if (alignment === StatusbarAlignment.RIGHT) {
-			dom.addClass(el, 'right');
+			addClass(el, 'right');
 		} else {
-			dom.addClass(el, 'left');
+			addClass(el, 'left');
 		}
 
 		$(el).setProperty(StatusbarPart.PRIORITY_PROP, priority);
@@ -207,13 +221,12 @@ export class StatusbarPart extends Part implements IStatusbarService {
 
 let manageExtensionAction: ManageExtensionAction;
 class StatusBarEntryItem implements IStatusbarItem {
-	private entry: IStatusbarEntry;
 
 	constructor(
-		entry: IStatusbarEntry,
+		private entry: IStatusbarEntry,
 		@ICommandService private commandService: ICommandService,
 		@IInstantiationService private instantiationService: IInstantiationService,
-		@IMessageService private messageService: IMessageService,
+		@INotificationService private notificationService: INotificationService,
 		@ITelemetryService private telemetryService: ITelemetryService,
 		@IContextMenuService private contextMenuService: IContextMenuService,
 		@IWorkbenchEditorService private editorService: IWorkbenchEditorService,
@@ -228,7 +241,7 @@ class StatusBarEntryItem implements IStatusbarItem {
 
 	public render(el: HTMLElement): IDisposable {
 		let toDispose: IDisposable[] = [];
-		dom.addClass(el, 'statusbar-entry');
+		addClass(el, 'statusbar-entry');
 
 		// Text Container
 		let textContainer: HTMLElement;
@@ -265,7 +278,7 @@ class StatusBarEntryItem implements IStatusbarItem {
 		// Context Menu
 		if (this.entry.extensionId) {
 			$(textContainer).on('contextmenu', e => {
-				dom.EventHelper.stop(e, true);
+				EventHelper.stop(e, true);
 
 				this.contextMenuService.showContextMenu({
 					getAnchor: () => el,
@@ -287,23 +300,6 @@ class StatusBarEntryItem implements IStatusbarItem {
 	private executeCommand(id: string, args?: any[]) {
 		args = args || [];
 
-		// Lookup built in commands
-		const builtInActionDescriptor = Registry.as<IWorkbenchActionRegistry>(ActionExtensions.WorkbenchActions).getWorkbenchAction(id);
-		if (builtInActionDescriptor) {
-			const action = this.instantiationService.createInstance(builtInActionDescriptor.syncDescriptor);
-
-			if (action.enabled) {
-				this.telemetryService.publicLog('workbenchActionExecuted', { id: action.id, from: 'status bar' });
-				(action.run() || TPromise.as(null)).done(() => {
-					action.dispose();
-				}, (err) => this.messageService.show(Severity.Error, toErrorMessage(err)));
-			} else {
-				this.messageService.show(Severity.Warning, nls.localize('canNotRun', "Command '{0}' is currently not enabled and can not be run.", action.label || id));
-			}
-
-			return;
-		}
-
 		// Maintain old behaviour of always focusing the editor here
 		const activeEditor = this.editorService.getActiveEditor();
 		const codeEditor = getCodeEditor(activeEditor);
@@ -311,8 +307,14 @@ class StatusBarEntryItem implements IStatusbarItem {
 			codeEditor.focus();
 		}
 
-		// Fallback to the command service for any other case
-		this.commandService.executeCommand(id, ...args).done(undefined, err => this.messageService.show(Severity.Error, toErrorMessage(err)));
+		/* __GDPR__
+			"workbenchActionExecuted" : {
+				"id" : { "classification": "SystemMetaData", "purpose": "FeatureInsight" },
+				"from": { "classification": "SystemMetaData", "purpose": "FeatureInsight" }
+			}
+		*/
+		this.telemetryService.publicLog('workbenchActionExecuted', { id, from: 'status bar' });
+		this.commandService.executeCommand(id, ...args).done(undefined, err => this.notificationService.error(toErrorMessage(err)));
 	}
 }
 

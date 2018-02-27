@@ -27,6 +27,7 @@ export interface IPickOpenEntry {
 	label: string;
 	description?: string;
 	detail?: string;
+	tooltip?: string;
 	separator?: ISeparator;
 	alwaysShow?: boolean;
 	run?: (context: IEntryRunContext) => void;
@@ -123,6 +124,7 @@ export interface IInputOptions {
 export interface IShowOptions {
 	quickNavigateConfiguration?: IQuickNavigateConfiguration;
 	inputSelection?: { start: number; end: number; };
+	autoFocus?: IAutoFocus;
 }
 
 export const IQuickOpenService = createDecorator<IQuickOpenService>('quickOpenService');

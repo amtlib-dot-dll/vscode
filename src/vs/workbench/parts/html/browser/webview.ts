@@ -6,79 +6,48 @@
 'use strict';
 
 import URI from 'vs/base/common/uri';
-import { TPromise } from 'vs/base/common/winjs.base';
 import { IDisposable, dispose } from 'vs/base/common/lifecycle';
 import Event, { Emitter } from 'vs/base/common/event';
 import { addDisposableListener, addClass } from 'vs/base/browser/dom';
-import { editorBackground, editorForeground } from 'vs/platform/theme/common/colorRegistry';
-import { ITheme, LIGHT, DARK } from 'vs/platform/theme/common/themeService';
+import { editorBackground, editorForeground, textLinkForeground } from 'vs/platform/theme/common/colorRegistry';
+import { ITheme, LIGHT, DARK, IThemeService } from 'vs/platform/theme/common/themeService';
 import { WebviewFindWidget } from './webviewFindWidget';
 import { IContextViewService } from 'vs/platform/contextview/browser/contextView';
 import { IContextKey } from 'vs/platform/contextkey/common/contextkey';
-
-export declare interface WebviewElement extends HTMLElement {
-	src: string;
-	preload: string;
-	send(channel: string, ...args: any[]);
-	openDevTools(): any;
-	getWebContents(): any;
-	findInPage(value: string, options?: WebviewElementFindInPageOptions);
-	stopFindInPage(action: string);
-}
-
-export class StopFindInPageActions {
-	static clearSelection = 'clearSelection';
-	static keepSelection = 'keepSelection';
-	static activateSelection = 'activateSelection';
-}
-
-export interface WebviewElementFindInPageOptions {
-	forward?: boolean;
-	findNext?: boolean;
-	matchCase?: boolean;
-	wordStart?: boolean;
-	medialCapitalAsWordStart?: boolean;
-}
-
-export interface FoundInPageResults {
-	requestId: number;
-	activeMatchOrdinal: number;
-	matches: number;
-	selectionArea: any;
-}
-
-type ApiThemeClassName = 'vscode-light' | 'vscode-dark' | 'vscode-high-contrast';
+import { IEnvironmentService } from 'vs/platform/environment/common/environment';
+import { normalize, nativeSep } from 'vs/base/common/paths';
+import { startsWith } from 'vs/base/common/strings';
 
 export interface WebviewOptions {
-	allowScripts?: boolean;
-	allowSvgs?: boolean;
-	svgWhiteList?: string[];
+	readonly allowScripts?: boolean;
+	readonly allowSvgs?: boolean;
+	readonly svgWhiteList?: string[];
+	readonly enableWrappedPostMessage?: boolean;
+	readonly useSameOriginForRoot?: boolean;
+	readonly localResourceRoots?: URI[];
 }
 
-export default class Webview {
-	private static index: number = 0;
-
-	private _webview: WebviewElement;
-	private _ready: TPromise<this>;
+export class Webview {
+	private readonly _webview: Electron.WebviewTag;
+	private _ready: Promise<this>;
 	private _disposables: IDisposable[] = [];
-	private _onDidClickLink = new Emitter<URI>();
-
-	private _onDidScroll = new Emitter<{ scrollYPercentage: number }>();
-	private _onFoundInPageResults = new Emitter<FoundInPageResults>();
 
 	private _webviewFindWidget: WebviewFindWidget;
 	private _findStarted: boolean = false;
+	private _contents: string = '';
 
 	constructor(
-		private parent: HTMLElement,
-		private _styleElement: Element,
-		@IContextViewService private _contextViewService: IContextViewService,
-		private _contextKey: IContextKey<boolean>,
-		private _findInputContextKey: IContextKey<boolean>,
-		private _options: WebviewOptions = {},
+		private readonly parent: HTMLElement,
+		private readonly _styleElement: Element,
+		private readonly _themeService: IThemeService,
+		private readonly _environmentService: IEnvironmentService,
+		private readonly _contextViewService: IContextViewService,
+		private readonly _contextKey: IContextKey<boolean>,
+		private readonly _findInputContextKey: IContextKey<boolean>,
+		private _options: WebviewOptions
 	) {
-		this._webview = <any>document.createElement('webview');
-		this._webview.setAttribute('partition', this._options.allowSvgs ? 'webview' : `webview${Webview.index++}`);
+		this._webview = document.createElement('webview');
+		this._webview.setAttribute('partition', this._options.allowSvgs ? 'webview' : `webview${Date.now()}`);
 
 		// disable auxclick events (see https://developers.google.com/web/updates/2016/10/auxclick)
 		this._webview.setAttribute('disableblinkfeatures', 'Auxclick');
@@ -92,9 +61,9 @@ export default class Webview {
 		this._webview.style.outline = '0';
 
 		this._webview.preload = require.toUrl('./webview-pre.js');
-		this._webview.src = require.toUrl('./webview.html');
+		this._webview.src = this._options.useSameOriginForRoot ? require.toUrl('./webview.html') : 'data:text/html;charset=utf-8,%3C%21DOCTYPE%20html%3E%0D%0A%3Chtml%20lang%3D%22en%22%20style%3D%22width%3A%20100%25%3B%20height%3A%20100%25%22%3E%0D%0A%3Chead%3E%0D%0A%09%3Ctitle%3EVirtual%20Document%3C%2Ftitle%3E%0D%0A%3C%2Fhead%3E%0D%0A%3Cbody%20style%3D%22margin%3A%200%3B%20overflow%3A%20hidden%3B%20width%3A%20100%25%3B%20height%3A%20100%25%22%3E%0D%0A%3C%2Fbody%3E%0D%0A%3C%2Fhtml%3E';
 
-		this._ready = new TPromise<this>(resolve => {
+		this._ready = new Promise<this>(resolve => {
 			const subscription = addDisposableListener(this._webview, 'ipc-message', (event) => {
 				if (event.channel === 'webview-ready') {
 					// console.info('[PID Webview] ' event.args[0]);
@@ -106,9 +75,22 @@ export default class Webview {
 			});
 		});
 
+		if (!this._options.useSameOriginForRoot) {
+			let loaded = false;
+			this._disposables.push(addDisposableListener(this._webview, 'did-start-loading', () => {
+				if (loaded) {
+					return;
+				}
+				loaded = true;
+
+				const contents = this._webview.getWebContents();
+				this.registerFileProtocols(contents);
+			}));
+		}
+
 		if (!this._options.allowSvgs) {
 			let loaded = false;
-			const subscription = addDisposableListener(this._webview, 'did-start-loading', () => {
+			this._disposables.push(addDisposableListener(this._webview, 'did-start-loading', () => {
 				if (loaded) {
 					return;
 				}
@@ -119,7 +101,7 @@ export default class Webview {
 					return;
 				}
 
-				contents.session.webRequest.onBeforeRequest((details, callback) => {
+				(contents.session.webRequest as any).onBeforeRequest((details, callback) => {
 					if (details.url.indexOf('.svg') > 0) {
 						const uri = URI.parse(details.url);
 						if (uri && !uri.scheme.match(/file/i) && (uri.path as any).endsWith('.svg') && !this.isAllowedSvg(uri)) {
@@ -130,7 +112,7 @@ export default class Webview {
 					return callback({});
 				});
 
-				contents.session.webRequest.onHeadersReceived((details, callback) => {
+				(contents.session.webRequest as any).onHeadersReceived((details, callback) => {
 					const contentType: string[] = (details.responseHeaders['content-type'] || details.responseHeaders['Content-Type']) as any;
 					if (contentType && Array.isArray(contentType) && contentType.some(x => x.toLowerCase().indexOf('image/svg') >= 0)) {
 						const uri = URI.parse(details.url);
@@ -141,9 +123,7 @@ export default class Webview {
 					}
 					return callback({ cancel: false, responseHeaders: details.responseHeaders });
 				});
-			});
-
-			this._disposables.push(subscription);
+			}));
 		}
 
 		this._disposables.push(
@@ -157,25 +137,30 @@ export default class Webview {
 				console.error('embedded page crashed');
 			}),
 			addDisposableListener(this._webview, 'ipc-message', (event) => {
-				if (event.channel === 'did-click-link') {
-					let [uri] = event.args;
-					this._onDidClickLink.fire(URI.parse(uri));
-					return;
-				}
+				switch (event.channel) {
+					case 'onmessage':
+						if (this._options.enableWrappedPostMessage && event.args && event.args.length) {
+							this._onMessage.fire(event.args[0]);
+						}
+						return;
 
-				if (event.channel === 'did-set-content') {
-					this._webview.style.flex = '';
-					this._webview.style.width = '100%';
-					this._webview.style.height = '100%';
-					this.layout();
-					return;
-				}
+					case 'did-click-link':
+						let [uri] = event.args;
+						this._onDidClickLink.fire(URI.parse(uri));
+						return;
 
-				if (event.channel === 'did-scroll') {
-					if (event.args && typeof event.args[0] === 'number') {
-						this._onDidScroll.fire({ scrollYPercentage: event.args[0] });
-					}
-					return;
+					case 'did-set-content':
+						this._webview.style.flex = '';
+						this._webview.style.width = '100%';
+						this._webview.style.height = '100%';
+						this.layout();
+						return;
+
+					case 'did-scroll':
+						if (event.args && typeof event.args[0] === 'number') {
+							this._onDidScroll.fire({ scrollYPercentage: event.args[0] });
+						}
+						return;
 				}
 			}),
 			addDisposableListener(this._webview, 'focus', () => {
@@ -187,14 +172,14 @@ export default class Webview {
 				if (this._contextKey) {
 					this._contextKey.reset();
 				}
-			}),
-			addDisposableListener(this._webview, 'found-in-page', (event) => {
-				this._onFoundInPageResults.fire(event.result);
 			})
 		);
 
 		this._webviewFindWidget = new WebviewFindWidget(this._contextViewService, this);
 		this._disposables.push(this._webviewFindWidget);
+
+		this.style(this._themeService.getTheme());
+		this._themeService.onThemeChange(this.style, this, this._disposables);
 
 		if (parent) {
 			parent.appendChild(this._webviewFindWidget.getDomNode());
@@ -214,6 +199,10 @@ export default class Webview {
 		this._onDidClickLink.dispose();
 		this._disposables = dispose(this._disposables);
 
+		if (this._contextKey) {
+			this._contextKey.reset();
+		}
+
 		if (this._webview.parentElement) {
 			this._webview.parentElement.removeChild(this._webview);
 			const findWidgetDomNode = this._webviewFindWidget.getDomNode();
@@ -221,44 +210,42 @@ export default class Webview {
 		}
 	}
 
-	get onDidClickLink(): Event<URI> {
-		return this._onDidClickLink.event;
-	}
+	private readonly _onDidClickLink = new Emitter<URI>();
+	public readonly onDidClickLink: Event<URI> = this._onDidClickLink.event;
 
-	get onDidScroll(): Event<{ scrollYPercentage: number }> {
-		return this._onDidScroll.event;
-	}
+	private readonly _onDidScroll = new Emitter<{ scrollYPercentage: number }>();
+	public readonly onDidScroll: Event<{ scrollYPercentage: number }> = this._onDidScroll.event;
 
-	get onFindResults(): Event<FoundInPageResults> {
-		return this._onFoundInPageResults.event;
-	}
+	private readonly _onMessage = new Emitter<any>();
+	public readonly onMessage: Event<any> = this._onMessage.event;
 
 	private _send(channel: string, ...args: any[]): void {
 		this._ready
 			.then(() => this._webview.send(channel, ...args))
-			.done(void 0, console.error);
+			.catch(err => console.error(err));
 	}
 
-	set initialScrollProgress(value: number) {
+	public set initialScrollProgress(value: number) {
 		this._send('initial-scroll-position', value);
 	}
 
-	set options(value: WebviewOptions) {
+	public set options(value: WebviewOptions) {
 		this._options = value;
 	}
 
-	set contents(value: string[]) {
+	public set contents(value: string) {
+		this._contents = value;
 		this._send('content', {
 			contents: value,
 			options: this._options
 		});
 	}
 
-	set baseUrl(value: string) {
+	public set baseUrl(value: string) {
 		this._send('baseUrl', value);
 	}
 
-	focus(): void {
+	public focus(): void {
 		this._webview.focus();
 		this._send('focus');
 	}
@@ -273,90 +260,20 @@ export default class Webview {
 		});
 	}
 
-	style(theme: ITheme): void {
+	private style(theme: ITheme): void {
 		const { fontFamily, fontWeight, fontSize } = window.getComputedStyle(this._styleElement); // TODO@theme avoid styleElement
 
-		let value = `
-		:root {
-			--background-color: ${theme.getColor(editorBackground)};
-			--color: ${theme.getColor(editorForeground)};
-			--font-family: ${fontFamily};
-			--font-weight: ${fontWeight};
-			--font-size: ${fontSize};
-		}
-		body {
-			background-color: var(--background-color);
-			color: var(--color);
-			font-family: var(--font-family);
-			font-weight: var(--font-weight);
-			font-size: var(--font-size);
-			margin: 0;
-			padding: 0 20px;
-		}
+		const styles = {
+			'background-color': theme.getColor(editorBackground).toString(),
+			'color': theme.getColor(editorForeground).toString(),
+			'font-family': fontFamily,
+			'font-weight': fontWeight,
+			'font-size': fontSize,
+			'link-color': theme.getColor(textLinkForeground).toString()
+		};
 
-		img {
-			max-width: 100%;
-			max-height: 100%;
-		}
-		a:focus,
-		input:focus,
-		select:focus,
-		textarea:focus {
-			outline: 1px solid -webkit-focus-ring-color;
-			outline-offset: -1px;
-		}
-		::-webkit-scrollbar {
-			width: 10px;
-			height: 10px;
-		}`;
-
-
-		let activeTheme: ApiThemeClassName;
-
-		if (theme.type === LIGHT) {
-			value += `
-			::-webkit-scrollbar-thumb {
-				background-color: rgba(100, 100, 100, 0.4);
-			}
-			::-webkit-scrollbar-thumb:hover {
-				background-color: rgba(100, 100, 100, 0.7);
-			}
-			::-webkit-scrollbar-thumb:active {
-				background-color: rgba(0, 0, 0, 0.6);
-			}`;
-
-			activeTheme = 'vscode-light';
-
-		} else if (theme.type === DARK) {
-			value += `
-			::-webkit-scrollbar-thumb {
-				background-color: rgba(121, 121, 121, 0.4);
-			}
-			::-webkit-scrollbar-thumb:hover {
-				background-color: rgba(100, 100, 100, 0.7);
-			}
-			::-webkit-scrollbar-thumb:active {
-				background-color: rgba(85, 85, 85, 0.8);
-			}`;
-
-			activeTheme = 'vscode-dark';
-
-		} else {
-			value += `
-			::-webkit-scrollbar-thumb {
-				background-color: rgba(111, 195, 223, 0.3);
-			}
-			::-webkit-scrollbar-thumb:hover {
-				background-color: rgba(111, 195, 223, 0.8);
-			}
-			::-webkit-scrollbar-thumb:active {
-				background-color: rgba(111, 195, 223, 0.8);
-			}`;
-
-			activeTheme = 'vscode-high-contrast';
-		}
-
-		this._send('styles', value, activeTheme);
+		const activeTheme = ApiThemeClassName.fromTheme(theme);
+		this._send('styles', styles, activeTheme);
 
 		this._webviewFindWidget.updateTheme(theme);
 	}
@@ -398,7 +315,25 @@ export default class Webview {
 		return false;
 	}
 
-	public startFind(value: string, options?: WebviewElementFindInPageOptions) {
+	private registerFileProtocols(contents: Electron.WebContents) {
+		if (!contents || contents.isDestroyed()) {
+			return;
+		}
+
+		registerFileProtocol(contents, 'vscode-core-resource', () => [
+			this._environmentService.appRoot
+		]);
+		registerFileProtocol(contents, 'vscode-extension-resource', () => [
+			this._environmentService.extensionsPath,
+			this._environmentService.appRoot,
+			this._environmentService.extensionDevelopmentPath
+		]);
+		registerFileProtocol(contents, 'vscode-workspace-resource', () =>
+			this._options.localResourceRoots.map(uri => uri.fsPath)
+		);
+	}
+
+	public startFind(value: string, options?: Electron.FindInPageOptions) {
 		if (!value) {
 			return;
 		}
@@ -407,7 +342,7 @@ export default class Webview {
 		options = options || {};
 
 		// FindNext must be false for a first request
-		const findOptions: WebviewElementFindInPageOptions = {
+		const findOptions: Electron.FindInPageOptions = {
 			forward: options.forward,
 			findNext: false,
 			matchCase: options.matchCase,
@@ -416,7 +351,6 @@ export default class Webview {
 
 		this._findStarted = true;
 		this._webview.findInPage(value, findOptions);
-		return;
 	}
 
 	/**
@@ -424,12 +358,10 @@ export default class Webview {
 	 * Successive calls to find will move forward or backward through onFindResults
 	 * depending on the supplied options.
 	 *
-	 * @param {string} value The string to search for. Empty strings are ignored.
-	 * @param {WebviewElementFindInPageOptions} [options]
-	 *
-	 * @memberOf Webview
+	 * @param value The string to search for. Empty strings are ignored.
+	 * @param options
 	 */
-	public find(value: string, options?: WebviewElementFindInPageOptions): void {
+	public find(value: string, options?: Electron.FindInPageOptions): void {
 		// Searching with an empty value will throw an exception
 		if (!value) {
 			return;
@@ -445,7 +377,7 @@ export default class Webview {
 
 	public stopFind(keepSelection?: boolean): void {
 		this._findStarted = false;
-		this._webview.stopFindInPage(keepSelection ? StopFindInPageActions.keepSelection : StopFindInPageActions.clearSelection);
+		this._webview.stopFindInPage(keepSelection ? 'keepSelection' : 'clearSelection');
 	}
 
 	public showFind() {
@@ -463,4 +395,50 @@ export default class Webview {
 	public showPreviousFindTerm() {
 		this._webviewFindWidget.showPreviousFindTerm();
 	}
+
+	public reload() {
+		this.contents = this._contents;
+	}
+}
+
+
+enum ApiThemeClassName {
+	light = 'vscode-light',
+	dark = 'vscode-dark',
+	highContrast = 'vscode-high-contrast'
+}
+
+namespace ApiThemeClassName {
+	export function fromTheme(theme: ITheme): ApiThemeClassName {
+		if (theme.type === LIGHT) {
+			return ApiThemeClassName.light;
+		} else if (theme.type === DARK) {
+			return ApiThemeClassName.dark;
+		} else {
+			return ApiThemeClassName.highContrast;
+		}
+	}
+}
+
+function registerFileProtocol(
+	contents: Electron.WebContents,
+	protocol: string,
+	getRoots: () => string[]
+) {
+	contents.session.protocol.registerFileProtocol(protocol, (request, callback: any) => {
+		const requestPath = URI.parse(request.url).fsPath;
+		for (const root of getRoots()) {
+			const normalizedPath = normalize(requestPath, true);
+			if (startsWith(normalizedPath, root + nativeSep)) {
+				callback({ path: normalizedPath });
+				return;
+			}
+
+		}
+		callback({ error: 'Cannot load resource outside of protocol root' });
+	}, (error) => {
+		if (error) {
+			console.error('Failed to register protocol ' + protocol);
+		}
+	});
 }

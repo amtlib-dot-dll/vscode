@@ -7,119 +7,62 @@
 
 declare module 'vscode' {
 
-	/**
-	 * Options to configure the behaviour of a file open dialog.
-	 */
-	export interface OpenDialogOptions {
+	export class FoldingRangeList {
+
 		/**
-		 * The resource the dialog shows when opened.
+		 * The folding ranges.
 		 */
-		defaultUri?: Uri;
+		ranges: FoldingRange[];
 
 		/**
-		 * A human-readable string for the open button.
-		 */
-		openLabel?: string;
-
-		/**
-		 * Only allow to select files. *Note* that not all operating systems support
-		 * to select files and folders in one dialog instance.
-		 */
-		openFiles?: boolean;
-
-		/**
-		 * Only allow to select folders. *Note* that not all operating systems support
-		 * to select files and folders in one dialog instance.
-		 */
-		openFolders?: boolean;
-
-		/**
-		 * Allow to select many files or folders.
-		 */
-		openMany?: boolean;
-
-		/**
-		 * A set of file filters that are shown in the dialog, e.g.
-		 * ```ts
-		 * {
-		 * 	['Images']: ['*.png', '*.jpg']
-		 * 	['TypeScript']: ['*.ts', '*.tsx']
-		 * }
-		 * ```
-		 */
-		filters: { [name: string]: string[] };
-	}
-
-	/**
-	 * Options to configure the behaviour of a file save dialog.
-	 */
-	export interface SaveDialogOptions {
-		/**
-		 * The resource the dialog shows when opened.
-		 */
-		defaultUri?: Uri;
-
-		/**
-		 * A human-readable string for the save button.
-		 */
-		saveLabel?: string;
-
-		/**
-		 * A set of file filters that are shown in the dialog, e.g.
-		 * ```ts
-		 * {
-		 * 	['Images']: ['*.png', '*.jpg']
-		 * 	['TypeScript']: ['*.ts', '*.tsx']
-		 * }
-		 * ```
-		 */
-		filters: { [name: string]: string[] };
-	}
-
-	export namespace window {
-
-		/**
-		 * Shows a file open dialog to the user.
+		 * Creates mew folding range list.
 		 *
-		 * @param options Options that control the dialog.
-		 * @returns A promise that resolves to the selected resources or `undefined`.
+		 * @param ranges The folding ranges
 		 */
-		export function showOpenDialog(options: OpenDialogOptions): Thenable<Uri[] | undefined>;
-
-		/**
-		 * Shows a file save dialog to the user.
-		 *
-		 * @param options Options that control the dialog.
-		 * @returns A promise that resolves to the selected resource or `undefined`.
-		 */
-		export function showSaveDialog(options: SaveDialogOptions): Thenable<Uri | undefined>;
-
-		/**
-		 * Shows a selection list of [workspace folders](#workspace.workspaceFolders) to pick from.
-		 * Returns `undefined` if no folder is open.
-		 *
-		 * @param options Configures the behavior of the workspace folder list.
-		 * @return A promise that resolves to the workspace folder or `undefined`.
-		 */
-		export function showWorkspaceFolderPick(options?: WorkspaceFolderPickOptions): Thenable<WorkspaceFolder | undefined>;
+		constructor(ranges: FoldingRange[]);
 	}
 
-	/**
-	 * Options to configure the behaviour of the [workspace folder](#WorkspaceFolder) pick UI.
-	 */
-	export interface WorkspaceFolderPickOptions {
+
+	export class FoldingRange {
 
 		/**
-		 * An optional string to show as place holder in the input box to guide the user what to pick on.
+		 * The start line number (0-based)
 		 */
-		placeHolder?: string;
+		startLine: number;
 
 		/**
-		 * Set to `true` to keep the picker open when focus moves to another part of the editor or to another window.
+		 * The end line number (0-based)
 		 */
-		ignoreFocusOut?: boolean;
+		endLine: number;
+
+		/**
+		 * The actual color value for this color range.
+		 */
+		type?: FoldingRangeType | string;
+
+		/**
+		 * Creates a new folding range.
+		 *
+		 * @param startLineNumber The first line of the fold
+		 * @param type The last line of the fold
+		 */
+		constructor(startLineNumber: number, endLineNumber: number, type?: FoldingRangeType | string);
 	}
 
+	export enum FoldingRangeType {
+		/**
+		 * Folding range for a comment
+		 */
+		Comment = 'comment',
+		/**
+		 * Folding range for a imports or includes
+		 */
+		Imports = 'imports',
+		/**
+		 * Folding range for a region (e.g. `#region`)
+		 */
+		Region = 'region'
+	}
 
 	// export enum FileErrorCodes {
 	// 	/**
@@ -192,25 +135,48 @@ declare module 'vscode' {
 	export interface FileStat {
 		id: number | string;
 		mtime: number;
+		// atime: number;
 		size: number;
 		type: FileType;
 	}
 
+	export interface TextSearchQuery {
+		pattern: string;
+		isRegex?: boolean;
+		isCaseSensitive?: boolean;
+		isWordMatch?: boolean;
+	}
+
+	export interface TextSearchOptions {
+		includes: GlobPattern[];
+		excludes: GlobPattern[];
+	}
+
+	export interface TextSearchResult {
+		uri: Uri;
+		range: Range;
+		preview: { leading: string, matching: string, trailing: string };
+	}
+
 	// todo@joh discover files etc
+	// todo@joh CancellationToken everywhere
+	// todo@joh add open/close calls?
 	export interface FileSystemProvider {
 
-		onDidChange?: Event<FileChange[]>;
+		readonly onDidChange?: Event<FileChange[]>;
 
-		root: Uri;
+		// todo@joh - remove this
+		readonly root?: Uri;
 
 		// more...
 		//
-		utimes(resource: Uri, mtime: number): Thenable<FileStat>;
+		utimes(resource: Uri, mtime: number, atime: number): Thenable<FileStat>;
 
 		stat(resource: Uri): Thenable<FileStat>;
 
 		read(resource: Uri, offset: number, length: number, progress: Progress<Uint8Array>): Thenable<number>;
 
+		// todo@joh - have an option to create iff not exist
 		// todo@remote
 		// offset - byte offset to start
 		// count - number of bytes to write
@@ -239,10 +205,58 @@ declare module 'vscode' {
 
 		// todo@remote
 		// create(resource: Uri): Thenable<FileStat>;
+
+		// find files by names
+		// todo@joh, move into its own provider
+		findFiles?(query: string, progress: Progress<Uri>, token: CancellationToken): Thenable<void>;
+		provideTextSearchResults?(query: TextSearchQuery, options: TextSearchOptions, progress: Progress<TextSearchResult>, token: CancellationToken): Thenable<void>;
 	}
 
 	export namespace workspace {
-		export function registerFileSystemProvider(authority: string, provider: FileSystemProvider): Disposable;
+		export function registerFileSystemProvider(scheme: string, provider: FileSystemProvider): Disposable;
+
+		/**
+		 * This method replaces `deleteCount` [workspace folders](#workspace.workspaceFolders) starting at index `start`
+		 * by an optional set of `workspaceFoldersToAdd` on the `vscode.workspace.workspaceFolders` array. This "splice"
+		 * behavior can be used to add, remove and change workspace folders in a single operation.
+		 *
+		 * If the first workspace folder is added, removed or changed, the currently executing extensions (including the
+		 * one that called this method) will be terminated and restarted so that the (deprecated) `rootPath` property is
+		 * updated to point to the first workspace folder.
+		 *
+		 * Use the [`onDidChangeWorkspaceFolders()`](#onDidChangeWorkspaceFolders) event to get notified when the
+		 * workspace folders have been updated.
+		 *
+		 * **Example:** adding a new workspace folder at the end of workspace folders
+		 * ```typescript
+		 * workspace.updateWorkspaceFolders(workspace.workspaceFolders ? workspace.workspaceFolders.length : 0, null, { uri: ...});
+		 * ```
+		 *
+		 * **Example:** removing the first workspace folder
+		 * ```typescript
+		 * workspace.updateWorkspaceFolders(0, 1);
+		 * ```
+		 *
+		 * **Example:** replacing an existing workspace folder with a new one
+		 * ```typescript
+		 * workspace.updateWorkspaceFolders(0, 1, { uri: ...});
+		 * ```
+		 *
+		 * It is valid to remove an existing workspace folder and add it again with a different name
+		 * to rename that folder.
+		 *
+		 * **Note:** it is not valid to call [updateWorkspaceFolders()](#updateWorkspaceFolders) multiple times
+		 * without waiting for the [`onDidChangeWorkspaceFolders()`](#onDidChangeWorkspaceFolders) to fire.
+		 *
+		 * @param start the zero-based location in the list of currently opened [workspace folders](#WorkspaceFolder)
+		 * from which to start deleting workspace folders.
+		 * @param deleteCount the optional number of workspace folders to remove.
+		 * @param workspaceFoldersToAdd the optional variable set of workspace folders to add in place of the deleted ones.
+		 * Each workspace is identified with a mandatory URI and an optional name.
+		 * @return true if the operation was successfully started and false otherwise if arguments were used that would result
+		 * in invalid workspace folder state (e.g. 2 folders with the same URI).
+		 */
+		export function updateWorkspaceFolders(start: number, deleteCount: number, ...workspaceFoldersToAdd: { uri: Uri, name?: string }[]): boolean;
 	}
 
 	export namespace window {
@@ -279,107 +293,418 @@ declare module 'vscode' {
 		export function registerDiffInformationCommand(command: string, callback: (diff: LineChange[], ...args: any[]) => any, thisArg?: any): Disposable;
 	}
 
-	/**
-	 * Represents a color in RGBA space.
-	 */
-	export class Color {
+	//#region decorations
 
-		/**
-		 * The red component of this color in the range [0-1].
-		 */
-		readonly red: number;
-
-		/**
-		 * The green component of this color in the range [0-1].
-		 */
-		readonly green: number;
-
-		/**
-		 * The blue component of this color in the range [0-1].
-		 */
-		readonly blue: number;
-
-		/**
-		 * The alpha component of this color in the range [0-1].
-		 */
-		readonly alpha: number;
-
-		constructor(red: number, green: number, blue: number, alpha: number);
+	//todo@joh -> make class
+	export interface DecorationData {
+		priority?: number;
+		title?: string;
+		bubble?: boolean;
+		abbreviation?: string;
+		color?: ThemeColor;
+		source?: string;
 	}
 
-	/**
-	 * Represents a color range from a document.
-	 */
-	export class ColorInformation {
-
-		/**
-		 * The range in the document where this color appers.
-		 */
-		range: Range;
-
-		/**
-		 * The actual color value for this color range.
-		 */
-		color: Color;
-
-		/**
-		 * Creates a new color range.
-		 *
-		 * @param range The range the color appears in. Must not be empty.
-		 * @param color The value of the color.
-		 * @param format The format in which this color is currently formatted.
-		 */
-		constructor(range: Range, color: Color);
+	export interface SourceControlResourceDecorations {
+		source?: string;
+		letter?: string;
+		color?: ThemeColor;
 	}
 
-	export class ColorPresentation {
-		/**
-		 * The label of this color presentation. It will be shown on the color
-		 * picker header. By default this is also the text that is inserted when selecting
-		 * this color presentation.
-		 */
-		label: string;
-		/**
-		 * An [edit](#TextEdit) which is applied to a document when selecting
-		 * this presentation for the color.  When `falsy` the [label](#ColorPresentation.label)
-		 * is used.
-		 */
-		textEdit?: TextEdit;
-		/**
-		 * An optional array of additional [text edits](#TextEdit) that are applied when
-		 * selecting this color presentation. Edits must not overlap with the main [edit](#ColorPresentation.textEdit) nor with themselves.
-		 */
-		additionalTextEdits?: TextEdit[];
-
-		/**
-		 * Creates a new color presentation.
-		 *
-		 * @param label The label of this color presentation.
-		 */
-		constructor(label: string);
+	export interface DecorationProvider {
+		onDidChangeDecorations: Event<undefined | Uri | Uri[]>;
+		provideDecoration(uri: Uri, token: CancellationToken): ProviderResult<DecorationData>;
 	}
 
+	export namespace window {
+		export function registerDecorationProvider(provider: DecorationProvider): Disposable;
+	}
+
+	//#endregion
+
 	/**
-	 * The document color provider defines the contract between extensions and feature of
-	 * picking and modifying colors in the editor.
+	 * Represents a debug adapter executable and optional arguments passed to it.
 	 */
-	export interface DocumentColorProvider {
+	export class DebugAdapterExecutable {
 		/**
-		 * Provide colors for the given document.
-		 *
-		 * @param document The document in which the command was invoked.
+		 * The command path of the debug adapter executable.
+		 * A command must be either an absolute path or the name of an executable looked up via the PATH environment variable.
+		 * The special value 'node' will be mapped to VS Code's built-in node runtime.
+		 */
+		readonly command: string;
+
+		/**
+		 * Optional arguments passed to the debug adapter executable.
+		 */
+		readonly args: string[];
+
+		/**
+		 * Create a new debug adapter specification.
+		 */
+		constructor(command: string, args?: string[]);
+	}
+
+	export interface DebugConfigurationProvider {
+		/**
+		 * This optional method is called just before a debug adapter is started to determine its excutable path and arguments.
+		 * Registering more than one debugAdapterExecutable for a type results in an error.
+		 * @param folder The workspace folder from which the configuration originates from or undefined for a folderless setup.
 		 * @param token A cancellation token.
-		 * @return An array of [color informations](#ColorInformation) or a thenable that resolves to such. The lack of a result
-		 * can be signaled by returning `undefined`, `null`, or an empty array.
+		 * @return a [debug adapter's executable and optional arguments](#DebugAdapterExecutable) or undefined.
 		 */
-		provideDocumentColors(document: TextDocument, token: CancellationToken): ProviderResult<ColorInformation[]>;
+		debugAdapterExecutable?(folder: WorkspaceFolder | undefined, token?: CancellationToken): ProviderResult<DebugAdapterExecutable>;
+	}
+
+	/**
+	 * The severity level of a log message
+	 */
+	export enum LogLevel {
+		Trace = 1,
+		Debug = 2,
+		Info = 3,
+		Warning = 4,
+		Error = 5,
+		Critical = 6,
+		Off = 7
+	}
+
+	/**
+	 * A logger for writing to an extension's log file, and accessing its dedicated log directory.
+	 */
+	export interface Logger {
+		readonly onDidChangeLogLevel: Event<LogLevel>;
+		readonly currentLevel: LogLevel;
+		readonly logDirectory: Thenable<string>;
+
+		trace(message: string, ...args: any[]): void;
+		debug(message: string, ...args: any[]): void;
+		info(message: string, ...args: any[]): void;
+		warn(message: string, ...args: any[]): void;
+		error(message: string | Error, ...args: any[]): void;
+		critical(message: string | Error, ...args: any[]): void;
+	}
+
+	export interface ExtensionContext {
 		/**
-		 * Provide representations for a color.
+		 * This extension's logger
 		 */
-		provideColorPresentations(document: TextDocument, colorInfo: ColorInformation, token: CancellationToken): ProviderResult<ColorPresentation[]>;
+		logger: Logger;
+	}
+
+	export interface RenameInitialValue {
+		range: Range;
+		text?: string;
 	}
 
 	export namespace languages {
-		export function registerColorProvider(selector: DocumentSelector, provider: DocumentColorProvider): Disposable;
+
+		/**
+		 * Register a folding provider.
+		 *
+		 * Multiple folding can be registered for a language. In that case providers are sorted
+		 * by their [score](#languages.match) and the best-matching provider is used. Failure
+		 * of the selected provider will cause a failure of the whole operation.
+		 *
+		 * @param selector A selector that defines the documents this provider is applicable to.
+		 * @param provider A folding provider.
+		 * @return A [disposable](#Disposable) that unregisters this provider when being disposed.
+		 */
+		export function registerFoldingProvider(selector: DocumentSelector, provider: FoldingProvider): Disposable;
+
+		export interface RenameProvider2 extends RenameProvider {
+			resolveInitialRenameValue?(document: TextDocument, position: Position, token: CancellationToken): ProviderResult<RenameInitialValue>;
+		}
 	}
+	export interface FoldingProvider {
+		provideFoldingRanges(document: TextDocument, token: CancellationToken): ProviderResult<FoldingRangeList>;
+	}
+
+	/**
+	 * Represents the validation type of the Source Control input.
+	 */
+	export enum SourceControlInputBoxValidationType {
+
+		/**
+		 * Something not allowed by the rules of a language or other means.
+		 */
+		Error = 0,
+
+		/**
+		 * Something suspicious but allowed.
+		 */
+		Warning = 1,
+
+		/**
+		 * Something to inform about but not a problem.
+		 */
+		Information = 2
+	}
+
+	export interface SourceControlInputBoxValidation {
+
+		/**
+		 * The validation message to display.
+		 */
+		readonly message: string;
+
+		/**
+		 * The validation type.
+		 */
+		readonly type: SourceControlInputBoxValidationType;
+	}
+
+	/**
+	 * Represents the input box in the Source Control viewlet.
+	 */
+	export interface SourceControlInputBox {
+
+		/**
+		 * A validation function for the input box. It's possible to change
+		 * the validation provider simply by setting this property to a different function.
+		 */
+		validateInput?(value: string, cursorPosition: number): ProviderResult<SourceControlInputBoxValidation | undefined | null>;
+	}
+
+	/**
+	 * Content settings for a webview.
+	 */
+	export interface WebviewOptions {
+		/**
+		 * Should scripts be enabled in the webview content?
+		 *
+		 * Defaults to false (scripts-disabled).
+		 */
+		readonly enableScripts?: boolean;
+
+		/**
+		 * Should command uris be enabled in webview content?
+		 *
+		 * Defaults to false.
+		 */
+		readonly enableCommandUris?: boolean;
+
+		/**
+		 * Should the webview's context be kept around even when the webview is no longer visible?
+		 *
+		 * Normally a webview's context is created when the webview becomes visible
+		 * and destroyed when the webview is hidden. Apps that have complex state
+		 * or UI can set the `retainContextWhenHidden` to make VS Code keep the webview
+		 * context around, even when the webview moves to a background tab. When
+		 * the webview becomes visible again, the context is automatically restored
+		 * in the exact same state it was in originally.
+		 *
+		 * `retainContextWhenHidden` has a high memory overhead and should only be used if
+		 * your webview's context cannot be quickly saved and restored.
+		 */
+		readonly retainContextWhenHidden?: boolean;
+
+		/**
+		 * Root paths from which the webview can load local (filesystem) resources using the `vscode-workspace-resource:` scheme.
+		 *
+		 * Default to the root folders of the current workspace.
+		 *
+		 * Pass in an empty array to disallow access to any local resources.
+		 */
+		readonly localResourceRoots?: Uri[];
+	}
+
+	/**
+	 * A webview is an editor with html content, like an iframe.
+	 */
+	export interface Webview {
+		/**
+		 * Type identifying the editor as a webview editor.
+		 */
+		readonly editorType: 'webview';
+
+		/**
+		 * Unique identifer of the webview.
+		 */
+		readonly uri: Uri;
+
+		/**
+		 * Content settings for the webview.
+		 */
+		readonly options: WebviewOptions;
+
+		/**
+		 * Title of the webview shown in UI.
+		 */
+		title: string;
+
+		/**
+		 * Contents of the webview.
+		 *
+		 * Should be a complete html document.
+		 */
+		html: string;
+
+		/**
+		 * The column in which the webview is showing.
+		 */
+		readonly viewColumn?: ViewColumn;
+
+		/**
+		 * Fired when the webview content posts a message.
+		 */
+		readonly onDidReceiveMessage: Event<any>;
+
+		/**
+		 * Fired when the webview is disposed.
+		 */
+		readonly onDidDispose: Event<void>;
+
+		/**
+		 * Fired when the webview's view column changes.
+		 */
+		readonly onDidChangeViewColumn: Event<ViewColumn>;
+
+		/**
+		 * Post a message to the webview content.
+		 *
+		 * Messages are only develivered if the webview is visible.
+		 *
+		 * @param message Body of the message.
+		 */
+		postMessage(message: any): Thenable<boolean>;
+
+		/**
+		 * Shows the webview in a given column.
+		 *
+		 * A webview may only show in a single column at a time. If it is already showing, this
+		 * command moves it to a new column.
+		 */
+		show(viewColumn: ViewColumn): void;
+
+		/**
+		 * Dispose of the the webview.
+		 *
+		 * This closes the webview if it showing and disposes of the resources owned by the webview.
+		 * Webview are also disposed when the user closes the webview editor. Both cases fire `onDispose`
+		 * event. Trying to use the webview after it has been disposed throws an exception.
+		 */
+		dispose(): any;
+	}
+
+	export interface TextEditor {
+		/**
+		 * Type identifying the editor as a text editor.
+		 */
+		readonly editorType: 'texteditor';
+	}
+
+	namespace window {
+		/**
+		 * Create and show a new webview.
+		 *
+		 * @param uri Unique identifier for the webview.
+		 * @param column Editor column to show the new webview in.
+		 * @param options Content settings for the webview.
+		 */
+		export function createWebview(uri: Uri, column: ViewColumn, options: WebviewOptions): Webview;
+
+		/**
+		 * Event fired when the active editor changes.
+		 */
+		export const onDidChangeActiveEditor: Event<TextEditor | Webview | undefined>;
+	}
+
+	export namespace window {
+
+		/**
+		 * Register a [TreeDataProvider](#TreeDataProvider) for the view contributed using the extension point `views`.
+		 * @param viewId Id of the view contributed using the extension point `views`.
+		 * @param treeDataProvider A [TreeDataProvider](#TreeDataProvider) that provides tree data for the view
+		 * @return handle to the [treeview](#TreeView) that can be disposable.
+		 */
+		export function registerTreeDataProvider<T>(viewId: string, treeDataProvider: TreeDataProvider<T>): TreeView<T>;
+
+	}
+
+	/**
+	 * Represents a Tree view
+	 */
+	export interface TreeView<T> extends Disposable {
+
+		/**
+		 * Reveal an element. By default revealed element is selected.
+		 *
+		 * In order to not to select, set the option `donotSelect` to `true`.
+		 *
+		 * **NOTE:** [TreeDataProvider](#TreeDataProvider) is required to implement [getParent](#TreeDataProvider.getParent) method to access this API.
+		 */
+		reveal(element: T, options?: { donotSelect?: boolean }): Thenable<void>;
+	}
+
+	/**
+	 * A data provider that provides tree data
+	 */
+	export interface TreeDataProvider<T> {
+		/**
+		 * An optional event to signal that an element or root has changed.
+		 * This will trigger the view to update the changed element/root and its children recursively (if shown).
+		 * To signal that root has changed, do not pass any argument or pass `undefined` or `null`.
+		 */
+		onDidChangeTreeData?: Event<T | undefined | null>;
+
+		/**
+		 * Get [TreeItem](#TreeItem) representation of the `element`
+		 *
+		 * @param element The element for which [TreeItem](#TreeItem) representation is asked for.
+		 * @return [TreeItem](#TreeItem) representation of the element
+		 */
+		getTreeItem(element: T): TreeItem | Thenable<TreeItem>;
+
+		/**
+		 * Get the children of `element` or root if no element is passed.
+		 *
+		 * @param element The element from which the provider gets children. Can be `undefined`.
+		 * @return Children of `element` or root if no element is passed.
+		 */
+		getChildren(element?: T): ProviderResult<T[]>;
+
+		/**
+		 * Optional method to return the parent of `element`.
+		 * Return `null` or `undefined` if `element` is a child of root.
+		 *
+		 * **NOTE:** This method should be implemented in order to access [reveal](#TreeView.reveal) API.
+		 *
+		 * @param element The element for which the parent has to be returned.
+		 * @return Parent of `element`.
+		 */
+		getParent?(element: T): ProviderResult<T>;
+	}
+
+	//#region TextEditor.visibleRange and related event
+
+	export interface TextEditor {
+		/**
+		 * The current visible ranges in the editor (vertically).
+		 * This accounts only for vertical scrolling, and not for horizontal scrolling.
+		 */
+		readonly visibleRanges: Range[];
+	}
+
+	/**
+	 * Represents an event describing the change in a [text editor's visible ranges](#TextEditor.visibleRanges).
+	 */
+	export interface TextEditorVisibleRangesChangeEvent {
+		/**
+		 * The [text editor](#TextEditor) for which the visible ranges have changed.
+		 */
+		textEditor: TextEditor;
+		/**
+		 * The new value for the [text editor's visible ranges](#TextEditor.visibleRanges).
+		 */
+		visibleRanges: Range[];
+	}
+
+	export namespace window {
+		/**
+		 * An [event](#Event) which fires when the selection in an editor has changed.
+		 */
+		export const onDidChangeTextEditorVisibleRanges: Event<TextEditorVisibleRangesChangeEvent>;
+	}
+
+	//#endregion
 }

@@ -5,9 +5,7 @@
 
 import fs = require('fs');
 import path = require('path');
-import { parse } from 'vs/base/common/json';
 import * as nls from 'vs/nls';
-import uri from 'vs/base/common/uri';
 import { TPromise } from 'vs/base/common/winjs.base';
 import * as strings from 'vs/base/common/strings';
 import * as objects from 'vs/base/common/objects';
@@ -15,16 +13,14 @@ import * as paths from 'vs/base/common/paths';
 import * as platform from 'vs/base/common/platform';
 import { IJSONSchema, IJSONSchemaSnippet } from 'vs/base/common/jsonSchema';
 import { IWorkspaceFolder } from 'vs/platform/workspace/common/workspace';
-import { IConfig, IRawAdapter, IAdapterExecutable, INTERNAL_CONSOLE_OPTIONS_SCHEMA } from 'vs/workbench/parts/debug/common/debug';
-import { IExtensionDescription } from 'vs/platform/extensions/common/extensions';
-import { IConfigurationResolverService } from 'vs/workbench/services/configurationResolver/common/configurationResolver';
+import { IConfig, IRawAdapter, IAdapterExecutable, INTERNAL_CONSOLE_OPTIONS_SCHEMA, IConfigurationManager } from 'vs/workbench/parts/debug/common/debug';
+import { IExtensionDescription } from 'vs/workbench/services/extensions/common/extensions';
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
 import { ICommandService } from 'vs/platform/commands/common/commands';
 
 export class Adapter {
 
-	constructor(private rawAdapter: IRawAdapter, public extensionDescription: IExtensionDescription,
-		@IConfigurationResolverService private configurationResolverService: IConfigurationResolverService,
+	constructor(private configurationManager: IConfigurationManager, private rawAdapter: IRawAdapter, public extensionDescription: IExtensionDescription,
 		@IConfigurationService private configurationService: IConfigurationService,
 		@ICommandService private commandService: ICommandService
 	) {
@@ -37,23 +33,32 @@ export class Adapter {
 
 	public getAdapterExecutable(root: IWorkspaceFolder, verifyAgainstFS = true): TPromise<IAdapterExecutable> {
 
-		if (this.rawAdapter.adapterExecutableCommand) {
-			return this.commandService.executeCommand<IAdapterExecutable>(this.rawAdapter.adapterExecutableCommand, root.uri.toString()).then(ad => {
-				return this.verifyAdapterDetails(ad, verifyAgainstFS);
-			});
-		}
+		return this.configurationManager.debugAdapterExecutable(root ? root.uri : undefined, this.rawAdapter.type).then(adapterExecutable => {
 
-		const adapterExecutable = <IAdapterExecutable>{
-			command: this.getProgram(),
-			args: this.getAttributeBasedOnPlatform('args')
-		};
-		const runtime = this.getRuntime();
-		if (runtime) {
-			const runtimeArgs = this.getAttributeBasedOnPlatform('runtimeArgs');
-			adapterExecutable.args = (runtimeArgs || []).concat([adapterExecutable.command]).concat(adapterExecutable.args || []);
-			adapterExecutable.command = runtime;
-		}
-		return this.verifyAdapterDetails(adapterExecutable, verifyAgainstFS);
+			if (adapterExecutable) {
+				return this.verifyAdapterDetails(adapterExecutable, verifyAgainstFS);
+			}
+
+			// try deprecated command based extension API
+			if (this.rawAdapter.adapterExecutableCommand && root) {
+				return this.commandService.executeCommand<IAdapterExecutable>(this.rawAdapter.adapterExecutableCommand, root.uri.toString()).then(ad => {
+					return this.verifyAdapterDetails(ad, verifyAgainstFS);
+				});
+			}
+
+			// fallback: executable contribution specified in package.json
+			adapterExecutable = <IAdapterExecutable>{
+				command: this.getProgram(),
+				args: this.getAttributeBasedOnPlatform('args')
+			};
+			const runtime = this.getRuntime();
+			if (runtime) {
+				const runtimeArgs = this.getAttributeBasedOnPlatform('runtimeArgs');
+				adapterExecutable.args = (runtimeArgs || []).concat([adapterExecutable.command]).concat(adapterExecutable.args || []);
+				adapterExecutable.command = runtime;
+			}
+			return this.verifyAdapterDetails(adapterExecutable, verifyAgainstFS);
+		});
 	}
 
 	private verifyAdapterDetails(details: IAdapterExecutable, verifyAgainstFS: boolean): TPromise<IAdapterExecutable> {
@@ -83,7 +88,7 @@ export class Adapter {
 		}
 
 		return TPromise.wrapError(new Error(nls.localize({ key: 'debugAdapterCannotDetermineExecutable', comment: ['Adapter executable file not found'] },
-			"Cannot determine executable for debug adapter '{0}'.", details.command)));
+			"Cannot determine executable for debug adapter '{0}'.", this.type)));
 	}
 
 	private getRuntime(): string {
@@ -126,10 +131,6 @@ export class Adapter {
 		return this.rawAdapter.languages;
 	}
 
-	public get startSessionCommand(): string {
-		return this.rawAdapter.startSessionCommand;
-	}
-
 	public merge(secondRawAdapter: IRawAdapter, extensionDescription: IExtensionDescription): void {
 		// Give priority to built in debug adapters
 		if (extensionDescription.isBuiltin) {
@@ -142,32 +143,7 @@ export class Adapter {
 		return !!this.rawAdapter.initialConfigurations;
 	}
 
-	public getInitialConfigurationContent(folderUri: uri, initialConfigs?: IConfig[]): TPromise<string> {
-		const editorConfig = this.configurationService.getConfiguration<any>();
-
-		// deprecated code: use DebugConfigurationProvider instead of command
-		if (typeof this.rawAdapter.initialConfigurations === 'string') {
-			// Contributed initialConfigurations is a command that needs to be invoked
-			// Debug adapter will dynamically provide the full launch.json
-			// TODO@Isidor stop supporting initialConfigurations
-			return this.commandService.executeCommand<string>(<string>this.rawAdapter.initialConfigurations, folderUri).then(content => {
-				// Debug adapter returned the full content of the launch.json - return it after format
-				try {
-					const config = parse(content);
-					config.configurations.push(...initialConfigs);
-					content = JSON.stringify(config, null, '\t').split('\n').map(line => '\t' + line).join('\n').trim();
-				} catch (e) {
-					// noop
-				}
-
-				if (editorConfig.editor && editorConfig.editor.insertSpaces) {
-					content = content.replace(new RegExp('\t', 'g'), strings.repeat(' ', editorConfig.editor.tabSize));
-				}
-				return content;
-			});
-		}
-		// end of deprecation
-
+	public getInitialConfigurationContent(initialConfigs?: IConfig[]): TPromise<string> {
 		// at this point we got some configs from the package.json and/or from registered DebugConfigurationProviders
 		let initialConfigurations = this.rawAdapter.initialConfigurations || [];
 		if (initialConfigs) {
@@ -175,7 +151,6 @@ export class Adapter {
 		}
 
 		const configs = JSON.stringify(initialConfigurations, null, '\t').split('\n').map(line => '\t' + line).join('\n').trim();
-
 		const comment1 = nls.localize('launch.config.comment1', "Use IntelliSense to learn about possible attributes.");
 		const comment2 = nls.localize('launch.config.comment2', "Hover to view descriptions of existing attributes.");
 		const comment3 = nls.localize('launch.config.comment3', "For more information, visit: {0}", 'https://go.microsoft.com/fwlink/?linkid=830387');
@@ -191,12 +166,13 @@ export class Adapter {
 		].join('\n');
 
 		// fix formatting
+		const editorConfig = this.configurationService.getValue<any>();
 		if (editorConfig.editor && editorConfig.editor.insertSpaces) {
 			content = content.replace(new RegExp('\t', 'g'), strings.repeat(' ', editorConfig.editor.tabSize));
 		}
 
 		return TPromise.as(content);
-	};
+	}
 
 	public getSchemaAttributes(): IJSONSchema[] {
 		if (!this.rawAdapter.configurationAttributes) {

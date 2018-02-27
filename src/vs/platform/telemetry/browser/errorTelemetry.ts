@@ -143,6 +143,17 @@ export default class ErrorTelemetry {
 
 	private _flushBuffer(): void {
 		for (let error of this._buffer) {
+			/* __GDPR__
+			"UnhandledError" : {
+					"message" : { "classification": "CallstackOrException", "purpose": "PerformanceAndHealth" },
+					"name": { "classification": "CallstackOrException", "purpose": "PerformanceAndHealth" },
+					"stack": { "classification": "CallstackOrException", "purpose": "PerformanceAndHealth" },
+					"id": { "classification": "CallstackOrException", "purpose": "PerformanceAndHealth" },
+					"line": { "classification": "CallstackOrException", "purpose": "PerformanceAndHealth" },
+					"column": { "classification": "CallstackOrException", "purpose": "PerformanceAndHealth" }
+				}
+			*/
+			// __GDPR__TODO__ what's the complete set of properties?
 			this._telemetryService.publicLog('UnhandledError', error);
 		}
 		this._buffer.length = 0;

@@ -10,7 +10,7 @@ import { TPromise } from 'vs/base/common/winjs.base';
 import * as Objects from 'vs/base/common/objects';
 import { asWinJsPromise } from 'vs/base/common/async';
 
-import { IExtensionDescription } from 'vs/platform/extensions/common/extensions';
+import { IExtensionDescription } from 'vs/workbench/services/extensions/common/extensions';
 import * as TaskSystem from 'vs/workbench/parts/tasks/common/tasks';
 
 import { MainContext, MainThreadTaskShape, ExtHostTaskShape, IMainContext } from 'vs/workbench/api/node/extHost.protocol';
@@ -19,9 +19,6 @@ import * as types from 'vs/workbench/api/node/extHostTypes';
 import { ExtHostWorkspace } from 'vs/workbench/api/node/extHostWorkspace';
 import * as vscode from 'vscode';
 
-interface StringMap<V> {
-	[key: string]: V;
-}
 
 /*
 namespace ProblemPattern {
@@ -297,11 +294,11 @@ namespace ShellConfiguration {
 
 namespace Tasks {
 
-	export function from(tasks: vscode.Task[], rootFolder: vscode.WorkspaceFolder, extension: IExtensionDescription): TaskSystem.Task[] {
+	export function from(tasks: vscode.Task[], rootFolder: vscode.WorkspaceFolder, extension: IExtensionDescription): TaskSystem.ContributedTask[] {
 		if (tasks === void 0 || tasks === null) {
 			return [];
 		}
-		let result: TaskSystem.Task[] = [];
+		let result: TaskSystem.ContributedTask[] = [];
 		for (let task of tasks) {
 			let converted = fromSingle(task, rootFolder, extension);
 			if (converted) {
@@ -341,6 +338,7 @@ namespace Tasks {
 		} else if (taskScope === types.TaskScope.Workspace) {
 			scope = TaskSystem.TaskScope.Workspace;
 		} else {
+			scope = TaskSystem.TaskScope.Folder;
 			workspaceFolder = taskScope;
 		}
 		let source: TaskSystem.ExtensionTaskSource = {
@@ -353,7 +351,7 @@ namespace Tasks {
 		// We can't transfer a workspace folder object from the extension host to main since they differ
 		// in shape and we don't have backwards converting function. So transfer the URI and resolve the
 		// workspace folder on the main side.
-		(source as any).__workspaceFolder = workspaceFolder ? workspaceFolder.uri as URI : undefined;
+		(source as any as TaskSystem.ExtensionTaskSourceTransfer).__workspaceFolder = workspaceFolder ? workspaceFolder.uri as URI : undefined;
 		let label = nls.localize('task.label', '{0}: {1}', source.label, task.name);
 		let key = (task as types.Task).definitionKey;
 		let kind = (task as types.Task).definition;
@@ -426,11 +424,11 @@ export class ExtHostTask implements ExtHostTaskShape {
 	private _handlers: Map<number, HandlerData>;
 
 	constructor(mainContext: IMainContext, extHostWorkspace: ExtHostWorkspace) {
-		this._proxy = mainContext.get(MainContext.MainThreadTask);
+		this._proxy = mainContext.getProxy(MainContext.MainThreadTask);
 		this._extHostWorkspace = extHostWorkspace;
 		this._handleCounter = 0;
 		this._handlers = new Map<number, HandlerData>();
-	};
+	}
 
 	public registerTaskProvider(extension: IExtensionDescription, provider: vscode.TaskProvider): vscode.Disposable {
 		if (!provider) {

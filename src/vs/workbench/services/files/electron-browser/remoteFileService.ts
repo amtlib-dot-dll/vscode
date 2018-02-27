@@ -6,30 +6,32 @@
 
 import URI from 'vs/base/common/uri';
 import { FileService } from 'vs/workbench/services/files/electron-browser/fileService';
-import { IContent, IStreamContent, IFileStat, IResolveContentOptions, IUpdateContentOptions, IResolveFileOptions, IResolveFileResult, FileOperationEvent, FileOperation, IFileSystemProvider, IStat, FileType, IImportResult, FileChangesEvent, ICreateFileOptions, FileOperationError, FileOperationResult } from 'vs/platform/files/common/files';
+import { IContent, IStreamContent, IFileStat, IResolveContentOptions, IUpdateContentOptions, IResolveFileOptions, IResolveFileResult, FileOperationEvent, FileOperation, IFileSystemProvider, IStat, FileType, IImportResult, FileChangesEvent, ICreateFileOptions, FileOperationError, FileOperationResult, ITextSnapshot, snapshotToString } from 'vs/platform/files/common/files';
 import { TPromise } from 'vs/base/common/winjs.base';
 import { basename, join } from 'path';
 import { IDisposable } from 'vs/base/common/lifecycle';
-import { groupBy, isFalsyOrEmpty, distinct } from 'vs/base/common/arrays';
-import { compare } from 'vs/base/common/strings';
+import { isFalsyOrEmpty, distinct } from 'vs/base/common/arrays';
 import { Schemas } from 'vs/base/common/network';
 import { Progress } from 'vs/platform/progress/common/progress';
-import { decodeStream, encode } from 'vs/base/node/encoding';
-import { StringTrieMap } from 'vs/base/common/map';
+import { decodeStream, encode, UTF8, UTF8_with_bom } from 'vs/base/node/encoding';
+import { TernarySearchTree } from 'vs/base/common/map';
 import { IConfigurationService } from 'vs/platform/configuration/common/configuration';
 import { IWorkspaceContextService } from 'vs/platform/workspace/common/workspace';
 import { IEnvironmentService } from 'vs/platform/environment/common/environment';
 import { ILifecycleService } from 'vs/platform/lifecycle/common/lifecycle';
-import { IMessageService } from 'vs/platform/message/common/message';
 import { IStorageService } from 'vs/platform/storage/common/storage';
 import { ITextResourceConfigurationService } from 'vs/editor/common/services/resourceConfiguration';
-import { IExtensionService } from 'vs/platform/extensions/common/extensions';
+import { IExtensionService } from 'vs/workbench/services/extensions/common/extensions';
+import { maxBufferLen, detectMimeAndEncodingFromBuffer } from 'vs/base/node/mime';
+import { MIME_BINARY } from 'vs/base/common/mime';
+import { localize } from 'vs/nls';
+import { IChoiceService } from 'vs/platform/dialogs/common/dialogs';
 
 function toIFileStat(provider: IFileSystemProvider, tuple: [URI, IStat], recurse?: (tuple: [URI, IStat]) => boolean): TPromise<IFileStat> {
 	const [resource, stat] = tuple;
 	const fileStat: IFileStat = {
 		isDirectory: false,
-		hasChildren: false,
+		isSymbolicLink: stat.type === FileType.Symlink,
 		resource: resource,
 		name: basename(resource.path),
 		mtime: stat.mtime,
@@ -37,41 +39,38 @@ function toIFileStat(provider: IFileSystemProvider, tuple: [URI, IStat], recurse
 		etag: stat.mtime.toString(29) + stat.size.toString(31),
 	};
 
-	if (stat.type === FileType.File) {
-		// done
-		return TPromise.as(fileStat);
+	if (stat.type === FileType.Dir) {
+		fileStat.isDirectory = true;
 
-	} else {
-		// dir -> resolve
-		return provider.readdir(resource).then(entries => {
-			fileStat.isDirectory = true;
-			fileStat.hasChildren = entries.length > 0;
+		if (recurse && recurse([resource, stat])) {
+			// dir -> resolve
+			return provider.readdir(resource).then(entries => {
+				fileStat.isDirectory = true;
 
-			if (recurse && recurse([resource, stat])) {
 				// resolve children if requested
 				return TPromise.join(entries.map(stat => toIFileStat(provider, stat, recurse))).then(children => {
 					fileStat.children = children;
 					return fileStat;
 				});
-			} else {
-				return fileStat;
-			}
-		});
+			});
+		}
 	}
+
+	// file or (un-resolved) dir
+	return TPromise.as(fileStat);
 }
 
 export function toDeepIFileStat(provider: IFileSystemProvider, tuple: [URI, IStat], to: URI[]): TPromise<IFileStat> {
 
-	const trie = new StringTrieMap<true>();
-	trie.insert(tuple[0].toString(), true);
+	const trie = TernarySearchTree.forPaths<true>();
+	trie.set(tuple[0].toString(), true);
 
 	if (!isFalsyOrEmpty(to)) {
-		to.forEach(uri => trie.insert(uri.toString(), true));
+		to.forEach(uri => trie.set(uri.toString(), true));
 	}
 
 	return toIFileStat(provider, tuple, candidate => {
-		const sub = trie.findSuperstr(candidate[0].toString());
-		return !!sub;
+		return Boolean(trie.findSuperstr(candidate[0].toString()) || trie.get(candidate[0].toString()));
 	});
 }
 
@@ -87,7 +86,7 @@ export class RemoteFileService extends FileService {
 		@IWorkspaceContextService contextService: IWorkspaceContextService,
 		@IEnvironmentService environmentService: IEnvironmentService,
 		@ILifecycleService lifecycleService: ILifecycleService,
-		@IMessageService messageService: IMessageService,
+		@IChoiceService choiceService: IChoiceService,
 		@ITextResourceConfigurationService textResourceConfigurationService: ITextResourceConfigurationService,
 	) {
 		super(
@@ -95,7 +94,7 @@ export class RemoteFileService extends FileService {
 			contextService,
 			environmentService,
 			lifecycleService,
-			messageService,
+			choiceService,
 			_storageService,
 			textResourceConfigurationService,
 		);
@@ -124,7 +123,7 @@ export class RemoteFileService extends FileService {
 		};
 	}
 
-	supportResource(resource: URI): boolean {
+	canHandleResource(resource: URI): boolean {
 		return resource.scheme === Schemas.file
 			|| this._provider.has(resource.scheme)
 			// TODO@remote
@@ -139,7 +138,7 @@ export class RemoteFileService extends FileService {
 			if (!provider) {
 				const err = new Error();
 				err.name = 'ENOPRO';
-				err.message = `no provider for ${resource.toString}`;
+				err.message = `no provider for ${resource.toString()}`;
 				throw err;
 			}
 			return provider;
@@ -169,7 +168,18 @@ export class RemoteFileService extends FileService {
 	}
 
 	resolveFiles(toResolve: { resource: URI; options?: IResolveFileOptions; }[]): TPromise<IResolveFileResult[], any> {
-		const groups = groupBy(toResolve, (a, b) => compare(a.resource.scheme, b.resource.scheme));
+
+		// soft-groupBy, keep order, don't rearrange/merge groups
+		let groups: (typeof toResolve)[] = [];
+		let group: typeof toResolve;
+		for (const request of toResolve) {
+			if (!group || group[0].resource.scheme !== request.resource.scheme) {
+				group = [];
+				groups.push(group);
+			}
+			group.push(request);
+		}
+
 		const promises: TPromise<IResolveFileResult[], any>[] = [];
 		for (const group of groups) {
 			if (group[0].resource.scheme === Schemas.file) {
@@ -217,28 +227,102 @@ export class RemoteFileService extends FileService {
 		}
 	}
 
-	private _doResolveContent(resource: URI, options: IResolveContentOptions): TPromise<IStreamContent> {
+	private _doResolveContent(resource: URI, options: IResolveContentOptions = Object.create(null)): TPromise<IStreamContent> {
 		return this._withProvider(resource).then(provider => {
+
 			return this.resolveFile(resource).then(fileStat => {
 
-				const encoding = this.getEncoding(resource);
-				const stream = decodeStream(encoding);
+				if (fileStat.isDirectory) {
+					// todo@joh cannot copy a folder
+					// https://github.com/Microsoft/vscode/issues/41547
+					throw new FileOperationError(
+						localize('fileIsDirectoryError', "File is directory"),
+						FileOperationResult.FILE_IS_DIRECTORY,
+						options
+					);
+				}
+				if (fileStat.etag === options.etag) {
+					throw new FileOperationError(
+						localize('fileNotModifiedError', "File not modified since"),
+						FileOperationResult.FILE_NOT_MODIFIED_SINCE,
+						options
+					);
+				}
 
-				provider.read(resource, 0, Number.MAX_VALUE, new Progress<Buffer>(chunk => stream.write(chunk))).then(() => {
-					stream.end();
-				}, err => {
-					stream.emit('error', err);
-					stream.end();
+				const guessEncoding = options.autoGuessEncoding;
+				const count = maxBufferLen(options);
+				const chunks: Buffer[] = [];
+
+				return provider.read(
+					resource,
+					0, count,
+					new Progress<Buffer>(chunk => chunks.push(chunk))
+				).then(bytesRead => {
+					// send to bla
+					return detectMimeAndEncodingFromBuffer({ bytesRead, buffer: Buffer.concat(chunks) }, guessEncoding);
+
+				}).then(detected => {
+					if (options.acceptTextOnly && detected.mimes.indexOf(MIME_BINARY) >= 0) {
+						return TPromise.wrapError<IStreamContent>(new FileOperationError(
+							localize('fileBinaryError', "File seems to be binary and cannot be opened as text"),
+							FileOperationResult.FILE_IS_BINARY,
+							options
+						));
+					}
+
+					let preferredEncoding: string;
+					if (options && options.encoding) {
+						if (detected.encoding === UTF8 && options.encoding === UTF8) {
+							preferredEncoding = UTF8_with_bom; // indicate the file has BOM if we are to resolve with UTF 8
+						} else {
+							preferredEncoding = options.encoding; // give passed in encoding highest priority
+						}
+					} else if (detected.encoding) {
+						if (detected.encoding === UTF8) {
+							preferredEncoding = UTF8_with_bom; // if we detected UTF-8, it can only be because of a BOM
+						} else {
+							preferredEncoding = detected.encoding;
+						}
+						// todo@remote - encoding logic should not be kept
+						// hostage inside the node file service
+						// } else if (super.configuredEncoding(resource) === UTF8_with_bom) {
+					} else {
+						preferredEncoding = UTF8; // if we did not detect UTF 8 BOM before, this can only be UTF 8 then
+					}
+
+					// const encoding = this.getEncoding(resource);
+					const stream = decodeStream(preferredEncoding);
+
+					// start with what we have already read
+					// and have a new stream to read the rest
+					let offset = 0;
+					for (const chunk of chunks) {
+						stream.write(chunk);
+						offset += chunk.length;
+					}
+					if (offset < count) {
+						// we didn't read enough the first time which means
+						// that we are done
+						stream.end();
+					} else {
+						// there is more to read
+						provider.read(resource, offset, -1, new Progress<Buffer>(chunk => stream.write(chunk))).then(() => {
+							stream.end();
+						}, err => {
+							stream.emit('error', err);
+							stream.end();
+						});
+					}
+
+					return {
+						encoding: preferredEncoding,
+						value: stream,
+						resource: fileStat.resource,
+						name: fileStat.name,
+						etag: fileStat.etag,
+						mtime: fileStat.mtime,
+					};
 				});
-
-				return {
-					encoding,
-					value: stream,
-					resource: fileStat.resource,
-					name: fileStat.name,
-					etag: fileStat.etag,
-					mtime: fileStat.mtime,
-				};
 			});
 		});
 	}
@@ -257,7 +341,7 @@ export class RemoteFileService extends FileService {
 
 				return prepare.then(exists => {
 					if (exists && options && !options.overwrite) {
-						return TPromise.wrapError(new FileOperationError('EEXIST', FileOperationResult.FILE_MODIFIED_SINCE));
+						return TPromise.wrapError(new FileOperationError('EEXIST', FileOperationResult.FILE_MODIFIED_SINCE, options));
 					}
 					return this._doUpdateContent(provider, resource, content || '', {});
 				}).then(fileStat => {
@@ -268,7 +352,7 @@ export class RemoteFileService extends FileService {
 		}
 	}
 
-	updateContent(resource: URI, value: string, options?: IUpdateContentOptions): TPromise<IFileStat> {
+	updateContent(resource: URI, value: string | ITextSnapshot, options?: IUpdateContentOptions): TPromise<IFileStat> {
 		if (resource.scheme === Schemas.file) {
 			return super.updateContent(resource, value, options);
 		} else {
@@ -278,9 +362,10 @@ export class RemoteFileService extends FileService {
 		}
 	}
 
-	private _doUpdateContent(provider: IFileSystemProvider, resource: URI, content: string, options: IUpdateContentOptions): TPromise<IFileStat> {
+	private _doUpdateContent(provider: IFileSystemProvider, resource: URI, content: string | ITextSnapshot, options: IUpdateContentOptions): TPromise<IFileStat> {
 		const encoding = this.getEncoding(resource, options.encoding);
-		return provider.write(resource, encode(content, encoding)).then(() => {
+		// TODO@Joh support streaming API for remote file system writes
+		return provider.write(resource, encode(typeof content === 'string' ? content : snapshotToString(content), encoding)).then(() => {
 			return this.resolveFile(resource);
 		});
 	}
@@ -397,10 +482,9 @@ export class RemoteFileService extends FileService {
 			: TPromise.as(null);
 
 		return prepare.then(() => {
-			// TODO@Joh This does only work for textfiles
-			// because the content turns things into a string
-			// and all binary data will be broken
-			return this.resolveContent(source).then(content => {
+			// todo@ben, can only copy text files
+			// https://github.com/Microsoft/vscode/issues/41543
+			return this.resolveContent(source, { acceptTextOnly: true }).then(content => {
 				return this._withProvider(target).then(provider => {
 					return this._doUpdateContent(provider, target, content.value, { encoding: content.encoding }).then(fileStat => {
 						this._onAfterOperation.fire(new FileOperationEvent(source, FileOperation.COPY, fileStat));
@@ -430,7 +514,7 @@ export class RemoteFileService extends FileService {
 	private _doTouchFile(resource: URI): TPromise<IFileStat> {
 		return this._withProvider(resource).then(provider => {
 			return provider.stat(resource).then(() => {
-				return provider.utimes(resource, Date.now());
+				return provider.utimes(resource, Date.now(), Date.now());
 			}, err => {
 				return provider.write(resource, new Uint8Array(0));
 			}).then(() => {

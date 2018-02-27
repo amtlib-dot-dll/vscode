@@ -1,5 +1,7 @@
 {
 	"name": "java",
+	"displayName": "%displayName%",
+	"description": "%description%",
 	"version": "0.1.0",
 	"publisher": "vscode",
 	"engines": { "vscode": "*" },
@@ -17,6 +19,10 @@
 			"language": "java",
 			"scopeName": "source.java",
 			"path": "./syntaxes/java.tmLanguage.json"
+		}],
+		"snippets": [{
+			"language": "java",
+			"path": "./snippets/java.snippets.json"
 		}]
 	}
 }
